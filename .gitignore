@@ -1,0 +1,12 @@
+# Python virtual environment
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Uploaded button icons (personal)
+assets/
+
+# Editor / OS noise
+.DS_Store

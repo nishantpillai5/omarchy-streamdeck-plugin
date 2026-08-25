@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""Stream Deck XL control bridge for the Omarchy shell.
+
+Reads JSON commands from stdin, one per line. Emits JSON events to stdout.
+Maintains persistent USB connection to the Stream Deck XL.
+
+Commands (stdin):
+  {"op":"config","brightness":50,"colors":{"fg":"#ffffff","bg":"#1a1a1a","accent":"#ff7700"}}
+  {"op":"set_buttons","buttons":[{...}]}
+  {"op":"set_brightness","value":50}
+  {"op":"exit"}
+
+Events (stdout):
+  {"ev":"ready","serial":"...","button_count":32}
+  {"ev":"disconnected"}
+  {"ev":"button_down","index":5}
+  {"ev":"button_up","index":5}
+  {"ev":"error","message":"..."}
+
+Button config schema (in set_buttons):
+  {
+    "index": 0..31,
+    "label": "text on button",
+    "icon_path": "/path/to/image.png",   // optional: overrides generated icon
+    "action_type": "command" | "keybinding",
+    "action_value": "shell command or key combo"
+  }
+
+The Stream Deck XL has 32 buttons (8 cols x 4 rows).
+Icon size: 96x96 pixels (the XL uses 96x96 key images).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+# Make the vendored StreamDeck package importable regardless of the interpreter
+# used to launch this script. It ships alongside this file in <plugin>/scripts/.
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+LOGFILE = Path.home() / ".cache" / "omarchy-streamdeck-bridge.log"
+LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+
+def log(msg):
+    print(msg, flush=True)
+    try:
+        with open(LOGFILE, "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+try:
+    from StreamDeck.DeviceManager import DeviceManager
+    from StreamDeck.ImageHelpers import PILHelper
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError as exc:
+    # Emit error as JSON so the QML panel can display it
+    log(json.dumps({"ev": "error", "message": f"Missing dependency: {exc}. Install python3-streamdeck and python-pillow."}))
+    sys.exit(1)
+
+# Defaults for when no device is connected yet (XL).
+ICON_SIZE = 96
+BUTTON_COUNT = 32
+
+class StreamDeckBridge:
+    def __init__(self):
+        self.deck = None
+        self.serial = ""
+        self.deck_type = ""
+        self.running = True
+        self.buttons: dict[int, dict] = {}
+        self.colors = {
+            "fg": "#ffffff",
+            "bg": "#1a1a1a",
+            "accent": "#ff7700",
+        }
+        self.brightness = 50
+        self._lock = threading.Lock()
+        self._font: ImageFont.FreeTypeFont | None = None
+        self._cached_icons: dict[int, bytes] = {}
+
+    def _icon_size(self) -> tuple[int, int]:
+        """Return (width, height) of a key image for the current device."""
+        if self.deck:
+            try:
+                fmt = self.deck.key_image_format()
+                return fmt["size"]
+            except Exception:
+                pass
+        return (ICON_SIZE, ICON_SIZE)
+
+    def _button_count(self) -> int:
+        """Return the number of physical keys on the current device."""
+        if self.deck:
+            try:
+                return self.deck.key_count()
+            except Exception:
+                pass
+        return BUTTON_COUNT
+
+    def _ensure_font(self):
+        """Find a suitable font for rendering button labels."""
+        if self._font is not None:
+            return
+        candidates = [
+            "/usr/share/fonts/nerd-fonts-complete/TTF/DejaVuSansMNerdFont-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    self._font = ImageFont.truetype(path, 18)
+                    return
+                except Exception:
+                    pass
+        # Fallback to default bitmap font
+        self._font = ImageFont.load_default()
+
+    def _hex_to_rgb(self, hex_color: str) -> tuple[int, int, int]:
+        hex_color = hex_color.lstrip("#")
+        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+    def _generate_icon(self, label: str) -> bytes:
+        """Generate a themed icon with the device's key size and label text."""
+        self._ensure_font()
+        w, h = self._icon_size()
+        bg = self._hex_to_rgb(self.colors.get("bg", "#1a1a1a"))
+        fg = self._hex_to_rgb(self.colors.get("fg", "#ffffff"))
+        accent = self._hex_to_rgb(self.colors.get("accent", "#ff7700"))
+
+        img = Image.new("RGB", (w, h), bg)
+        draw = ImageDraw.Draw(img)
+
+        # Draw a subtle accent border
+        draw.rectangle([2, 2, w - 3, h - 3], outline=accent, width=2)
+
+        # Draw label text centered
+        if label and self._font:
+            # Wrap text to fit
+            max_width = w - 16
+            lines = []
+            words = label.split()
+            current = ""
+            for word in words:
+                test = current + " " + word if current else word
+                bbox = draw.textbbox((0, 0), test, font=self._font)
+                if bbox[2] - bbox[0] <= max_width:
+                    current = test
+                else:
+                    if current:
+                        lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+
+            # Limit to 3 lines
+            lines = lines[:3]
+            line_height = 20
+            total_height = len(lines) * line_height
+            y = (h - total_height) // 2
+
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=self._font)
+                text_width = bbox[2] - bbox[0]
+                x = (w - text_width) // 2
+                draw.text((x, y), line, font=self._font, fill=fg)
+                y += line_height
+
+        return PILHelper.to_native_format(self.deck, img)
+
+    def _get_icon(self, btn: dict) -> bytes:
+        """Get icon bytes for a button, using custom path or generating one."""
+        index = btn["index"]
+        icon_path = btn.get("icon_path", "")
+        w, h = self._icon_size()
+
+        if icon_path and os.path.isfile(icon_path):
+            try:
+                img = Image.open(icon_path)
+                img = img.convert("RGB")
+                img = img.resize((w, h), Image.LANCZOS)
+                return PILHelper.to_native_format(self.deck, img)
+            except Exception:
+                pass
+
+        # Generate themed icon
+        label = btn.get("label", "")
+        cache_key = f"{label}:{self.colors.get('fg')}:{self.colors.get('bg')}:{self.colors.get('accent')}"
+        if index in self._cached_icons and self._cached_icons.get("_key") == cache_key:
+            return self._cached_icons[index]
+
+        icon = self._generate_icon(label)
+        self._cached_icons[index] = icon
+        self._cached_icons["_key"] = cache_key
+        return icon
+
+    def _update_button(self, index: int):
+        """Push a single button's image to the hardware."""
+        if not self.deck:
+            log(json.dumps({"ev": "debug", "msg": f"_update_button[{index}]: no deck"}))
+            return
+        count = self._button_count()
+        if index < 0 or index >= count:
+            return
+        btn = self.buttons.get(index)
+        w, h = self._icon_size()
+        if not btn:
+            # Clear button
+            img = Image.new("RGB", (w, h), (0, 0, 0))
+            self.deck.set_key_image(index, PILHelper.to_native_format(self.deck, img))
+            return
+        try:
+            icon = self._get_icon(btn)
+            self.deck.set_key_image(index, icon)
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"set_key_image[{index}]: {exc}"}))
+
+    def _update_all_buttons(self):
+        """Push all configured buttons to the hardware."""
+        if not self.deck:
+            log(json.dumps({"ev": "debug", "msg": "_update_all_buttons: no deck"}))
+            return
+        log(json.dumps({"ev": "debug", "msg": f"Updating {self._button_count()} buttons ({len(self.buttons)} configured)"}))
+        for index in range(self._button_count()):
+            self._update_button(index)
+        log(json.dumps({"ev": "debug", "msg": "All buttons updated"}))
+
+    def _on_key_change(self, deck, key, state):
+        """Callback when a Stream Deck key changes state."""
+        event_type = "button_down" if state else "button_up"
+        log(json.dumps({"ev": event_type, "index": key, "state": state}))
+        if state:
+            # Debounce: ignore presses within 300ms of each other
+            import time
+            now = time.time()
+            if not hasattr(self, '_last_press_time'):
+                self._last_press_time = {}
+            last_time = self._last_press_time.get(key, 0)
+            if now - last_time < 0.3:
+                log(json.dumps({"ev": "debug", "msg": f"Debounced press for key {key}"}))
+                return
+            self._last_press_time[key] = now
+            self._handle_press(key)
+
+    def _handle_press(self, index: int):
+        """Execute the action mapped to a button index."""
+        log(json.dumps({"ev": "debug", "msg": f"_handle_press({index}) called"}))
+        log(json.dumps({"ev": "debug", "msg": f"Available buttons: {list(self.buttons.keys())}"}))
+        btn = self.buttons.get(index)
+        if not btn:
+            log(json.dumps({"ev": "debug", "msg": f"No button configured at index {index}"}))
+            return
+        action_type = btn.get("action_type", "")
+        action_value = btn.get("action_value", "")
+        if not action_type or not action_value:
+            return
+
+        try:
+            if action_type == "command":
+                # Execute shell command detached
+                subprocess.Popen(action_value, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif action_type == "keybinding":
+                # Use wtype or ydotool or hyprctl dispatch
+                # Try multiple methods for robustness
+                self._send_keybinding(action_value)
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"action[{index}]: {exc}"}))
+
+    def _send_keybinding(self, combo: str):
+        """Send a keybinding using available tools."""
+        # Parse combos like "SUPER+ALT+ENTER" or "CTRL+SHIFT+t"
+        # Try wtype first (Wayland), then ydotool, then hyprctl dispatch
+        parts = combo.upper().split("+")
+        key = parts[-1].strip().lower()
+        modifiers = [p.strip() for p in parts[:-1]]
+        log(json.dumps({"ev": "debug", "msg": f"Keybinding: combo={combo}, key={key}, modifiers={modifiers}"}))
+
+        # Try wtype
+        wtype_path = subprocess.run(["which", "wtype"], capture_output=True, text=True).stdout.strip()
+        if wtype_path:
+            mod_args = []
+            for mod in modifiers:
+                mod_lower = mod.lower()
+                if mod_lower in ("super", "win", "cmd"):
+                    mod_args.extend(["-M", "logo"])
+                elif mod_lower == "alt":
+                    mod_args.extend(["-M", "alt"])
+                elif mod_lower == "ctrl":
+                    mod_args.extend(["-M", "control"])
+                elif mod_lower == "shift":
+                    mod_args.extend(["-M", "shift"])
+            # Map common key names to xkbcommon names (wtype)
+            key_map = {
+                "enter": "Return",
+                "return": "Return",
+                "space": "space",
+                "tab": "Tab",
+                "escape": "Escape",
+                "esc": "Escape",
+                "backspace": "BackSpace",
+                "delete": "Delete",
+                "up": "Up",
+                "down": "Down",
+                "left": "Left",
+                "right": "Right",
+                "pageup": "Page_Up",
+                "pagedown": "Page_Down",
+                "home": "Home",
+                "end": "End",
+                "insert": "Insert",
+            }
+            wtype_key = key_map.get(key, key.capitalize())
+            # Use explicit press/release for better compatibility
+            # Add small delay for compositor to register modifier
+            import time
+            time.sleep(0.05)
+            args = ["wtype"] + mod_args + ["-P", wtype_key, "-p", wtype_key]
+            for mod in modifiers:
+                mod_lower = mod.lower()
+                if mod_lower in ("super", "win", "cmd"):
+                    args.extend(["-m", "logo"])
+                elif mod_lower == "alt":
+                    args.extend(["-m", "alt"])
+                elif mod_lower == "ctrl":
+                    args.extend(["-m", "control"])
+                elif mod_lower == "shift":
+                    args.extend(["-m", "shift"])
+            log(json.dumps({"ev": "debug", "msg": f"wtype command: {args}"}))
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        # Try hyprctl dispatch (for Hyprland)
+        hyprctl_path = subprocess.run(["which", "hyprctl"], capture_output=True, text=True).stdout.strip()
+        if hyprctl_path:
+            # Map to hyprctl key format
+            mod_str = ""
+            for mod in modifiers:
+                mod_lower = mod.lower()
+                if mod_lower in ("super", "win"):
+                    mod_str += "SUPER_"
+                elif mod_lower == "alt":
+                    mod_str += "ALT_"
+                elif mod_lower == "ctrl":
+                    mod_str += "CONTROL_"
+                elif mod_lower == "shift":
+                    mod_str += "SHIFT_"
+            hypr_key = key.upper()
+            full_key = mod_str + hypr_key if mod_str else hypr_key
+            subprocess.Popen(["hyprctl", "dispatch", "exec", f"ydotool key {full_key}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        # Fallback: try ydotool directly
+        ydotool_path = subprocess.run(["which", "ydotool"], capture_output=True, text=True).stdout.strip()
+        if ydotool_path:
+            mod_str = ""
+            for mod in modifiers:
+                mod_lower = mod.lower()
+                if mod_lower in ("super", "win"):
+                    mod_str += "125:1 "
+                elif mod_lower == "alt":
+                    mod_str += "56:1 "
+                elif mod_lower == "ctrl":
+                    mod_str += "29:1 "
+                elif mod_lower == "shift":
+                    mod_str += "42:1 "
+            # Need keycode mapping - this is approximate
+            subprocess.Popen(["ydotool", "key", mod_str + key],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        log(json.dumps({"ev": "error", "message": f"No keybinding tool available (tried wtype, hyprctl, ydotool)"}))
+
+    def _find_deck(self):
+        """Discover and open any Stream Deck (XL, Original, V2)."""
+        devices = DeviceManager().enumerate()
+        for device in devices:
+            try:
+                device.open()
+            except Exception:
+                continue
+            dtype = device.deck_type()
+            # Accept known key-based devices (ignore pedals / touch-only)
+            if dtype in ("Stream Deck XL", "Stream Deck Original", "Stream Deck Original V2"):
+                self.deck = device
+                self.deck_type = dtype
+                self.serial = device.get_serial_number()
+                device.set_key_callback(self._on_key_change)
+                return True
+            try:
+                device.close()
+            except Exception:
+                pass
+        return False
+
+    def connect(self):
+        """Connect to the Stream Deck."""
+        try:
+            if self._find_deck():
+                self.deck.set_brightness(self.brightness)
+                log(json.dumps({
+                    "ev": "ready",
+                    "serial": self.serial,
+                    "deck_type": self.deck_type,
+                    "button_count": self._button_count()
+                }))
+                # Update buttons with loaded config
+                self._update_all_buttons()
+            else:
+                log(json.dumps({"ev": "error", "message": "No Stream Deck found. Check USB connection and udev rules."}))
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"Connect failed: {exc}"}))
+            traceback.print_exc(file=sys.stderr)
+
+    def disconnect(self):
+        """Close the device."""
+        if self.deck:
+            try:
+                self.deck.reset()
+                self.deck.close()
+            except Exception:
+                pass
+            self.deck = None
+        log(json.dumps({"ev": "disconnected"}))
+
+    def set_brightness(self, value: int):
+        self.brightness = max(0, min(100, value))
+        if self.deck:
+            try:
+                self.deck.set_brightness(self.brightness)
+            except Exception as exc:
+                log(json.dumps({"ev": "error", "message": f"Brightness: {exc}"}))
+
+    def set_colors(self, colors: dict):
+        self.colors = colors
+        self._cached_icons.clear()
+        self._update_all_buttons()
+
+    def set_buttons(self, buttons: list[dict]):
+        self.buttons = {}
+        count = self._button_count()
+        for btn in buttons:
+            idx = btn.get("index", -1)
+            if 0 <= idx < count:
+                self.buttons[idx] = btn
+        self._cached_icons.clear()
+        self._update_all_buttons()
+
+    def run(self):
+        """Main loop: read commands from stdin."""
+        # Attempt initial connection
+        self.connect()
+
+        while self.running:
+            try:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                cmd = json.loads(line)
+                op = cmd.get("op", "")
+
+                if op == "config":
+                    if "brightness" in cmd:
+                        self.set_brightness(cmd["brightness"])
+                    if "colors" in cmd:
+                        self.set_colors(cmd["colors"])
+
+                elif op == "set_buttons":
+                    btns = cmd.get("buttons", [])
+                    log(json.dumps({"ev": "debug", "msg": f"set_buttons received with {len(btns)} buttons"}))
+                    self.set_buttons(btns)
+
+                elif op == "set_brightness":
+                    log(json.dumps({"ev": "debug", "msg": f"set_brightness: {cmd.get('value', 50)}"}))
+                    self.set_brightness(cmd.get("value", 50))
+
+                elif op == "reconnect":
+                    self.disconnect()
+                    time.sleep(0.5)
+                    self.connect()
+
+                elif op == "exit":
+                    self.running = False
+
+                elif op == "ping":
+                    log(json.dumps({"ev": "pong"}))
+
+            except json.JSONDecodeError:
+                log(json.dumps({"ev": "error", "message": "Invalid JSON on stdin"}))
+            except Exception as exc:
+                log(json.dumps({"ev": "error", "message": f"Command error: {exc}"}))
+                traceback.print_exc(file=sys.stderr)
+
+        self.disconnect()
+
+
+def main():
+    bridge = StreamDeckBridge()
+    
+    # Load buttons from config file on startup
+    import os
+    config_path = os.path.expanduser("~/.config/omarchy/streamdeck/buttons.json")
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+            btns = config.get("buttons", [])
+            bridge.buttons = {}
+            for btn in btns:
+                idx = btn.get("index", -1)
+                if 0 <= idx < BUTTON_COUNT:
+                    bridge.buttons[idx] = btn
+            log(json.dumps({"ev": "debug", "msg": f"Loaded {len(bridge.buttons)} buttons from {config_path}"}))
+    except Exception as exc:
+        log(json.dumps({"ev": "debug", "msg": f"Could not load config: {exc}"}))
+    
+    bridge.run()
+
+
+if __name__ == "__main__":
+    main()

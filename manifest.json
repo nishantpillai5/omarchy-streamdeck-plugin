@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "elgato.streamdeck",
+  "name": "Stream Deck",
+  "version": "1.0.0",
+  "author": "Dennis Munzlinger",
+  "license": "MIT",
+  "description": "Control Elgato Stream Deck devices (XL, Original, Original V2) from the Omarchy bar. Assign shell commands and keyboard shortcuts to buttons with themed icons.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Stream Deck",
+    "description": "Stream Deck XL controller with configurable buttons.",
+    "category": "System",
+    "aliases": ["streamdeck", "deck"],
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "defaults": {
+      "brightness": 50
+    },
+    "schema": [
+      {
+        "key": "brightness",
+        "type": "integer",
+        "label": "Default brightness",
+        "min": 0,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 50,
+        "description": "Button brightness when the device connects."
+      }
+    ]
+  }
+}
