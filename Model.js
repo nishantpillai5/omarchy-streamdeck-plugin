@@ -1,29 +1,58 @@
 // Stream Deck button configuration model.
 //
 // Persisted in ~/.config/omarchy/streamdeck/buttons.json
-// Schema:
+//
+// Schema v3 (user-managed profiles):
 // {
-//   "version": 1,
-//   "buttons": [
+//   "version": 3,
+//   "activeProfileId": "work-xl",
+//   "profiles": [
 //     {
-//       "index": 0,           // 0..31 (Stream Deck XL)
-//       "label": "Terminal",
-//       "icon_path": "",      // optional absolute path to custom image
-//       "action_type": "command",     // "command" | "keybinding"
-//       "action_value": "alacritty"
+//       "id": "work-xl",
+//       "name": "Work XL",
+//       "layout": "xl",          // "xl" (32 keys) | "original" (15 keys)
+//       "buttons": [ { "index": 0, "label": "...", "icon_path": "", "action_type": "command", "action_value": "..." }, ... ]
 //     }
-//   ]
+//   ],
+//   "defaults": {
+//     "xl": "work-xl",           // profile id auto-applied when an XL connects
+//     "original": "work-orig"    // profile id auto-applied when an Original connects
+//   }
 // }
+//
+// Legacy schemas are migrated on load:
+//   v1: { "version": 1, "buttons": [ ...32 entries... ] }
+//   v2: { "version": 2, "profiles": { "xl": {...}, "original": {...} } }
 
-var SCHEMA_VERSION = 1;
-var BUTTON_COUNT = 32;
-// Pass home dir from QML side to avoid Quickshell dependency in JS module
+var SCHEMA_VERSION = 3;
+// Pass home dir from QML side to avoid Quickshell dependency in JS module.
 var CONFIG_DIR = "";
 var CONFIG_PATH = "";
 
 function setHomeDir(home) {
   CONFIG_DIR = home + "/.config/omarchy/streamdeck";
   CONFIG_PATH = CONFIG_DIR + "/buttons.json";
+}
+
+// Available layouts. `key` is the stable identifier; `buttonCount` drives the
+// grid and the number of button slots a profile holds.
+var LAYOUTS = [
+  { key: "xl", label: "Stream Deck XL", buttonCount: 32, cols: 8, rows: 4 },
+  { key: "original", label: "Stream Deck Original", buttonCount: 15, cols: 5, rows: 3 }
+];
+
+function layoutByKey(key) {
+  for (var i = 0; i < LAYOUTS.length; i++) {
+    if (LAYOUTS[i].key === key) return LAYOUTS[i];
+  }
+  return null;
+}
+
+function layoutKeyForDeckType(deckType) {
+  var t = String(deckType || "");
+  if (t.indexOf("XL") >= 0) return "xl";
+  if (t.indexOf("Original") >= 0) return "original";
+  return "xl";
 }
 
 function emptyButton(index) {
@@ -36,14 +65,66 @@ function emptyButton(index) {
   };
 }
 
-function emptyConfig() {
-  var buttons = [];
-  for (var i = 0; i < BUTTON_COUNT; i++) {
-    buttons.push(emptyButton(i));
+function emptyButtons(count) {
+  var arr = [];
+  for (var i = 0; i < count; i++) {
+    arr.push(emptyButton(i));
   }
+  return arr;
+}
+
+function newProfileId() {
+  return "profile-" + Date.now().toString(36);
+}
+
+function newProfile(name, layoutKey) {
+  var layout = layoutByKey(layoutKey) || LAYOUTS[0];
+  return {
+    id: newProfileId(),
+    name: name || layout.label,
+    layout: layout.key,
+    buttons: emptyButtons(layout.buttonCount)
+  };
+}
+
+// A fresh config with two starter profiles (one per layout).
+function emptyConfig() {
+  var xl = newProfile("Stream Deck XL", "xl");
+  xl.id = "xl";
+  var orig = newProfile("Stream Deck Original", "original");
+  orig.id = "original";
   return {
     version: SCHEMA_VERSION,
-    buttons: buttons
+    activeProfileId: "xl",
+    profiles: [xl, orig],
+    defaults: { xl: "xl", original: "original" }
+  };
+}
+
+// Normalize a single profile's buttons to exactly `count` entries.
+function normalizeButtons(srcButtons, count) {
+  var buttons = emptyButtons(count);
+  var src = Array.isArray(srcButtons) ? srcButtons : [];
+  for (var i = 0; i < count; i++) {
+    var s = src[i];
+    if (s && typeof s === "object") {
+      if (typeof s.label === "string") buttons[i].label = s.label;
+      if (typeof s.icon_path === "string") buttons[i].icon_path = s.icon_path;
+      if (typeof s.action_type === "string") buttons[i].action_type = s.action_type;
+      if (typeof s.action_value === "string") buttons[i].action_value = s.action_value;
+    }
+  }
+  return buttons;
+}
+
+function normalizeProfile(src, fallbackId, fallbackName, fallbackLayout) {
+  var layoutKey = (src && src.layout && layoutByKey(src.layout)) ? src.layout : fallbackLayout;
+  var layout = layoutByKey(layoutKey);
+  return {
+    id: (src && typeof src.id === "string" && src.id) ? src.id : fallbackId,
+    name: (src && typeof src.name === "string" && src.name) ? src.name : fallbackName,
+    layout: layoutKey,
+    buttons: normalizeButtons(src ? src.buttons : [], layout.buttonCount)
   };
 }
 
@@ -56,21 +137,73 @@ function parseConfig(text) {
     if (!parsed || typeof parsed !== "object") {
       return { config: emptyConfig(), error: "Invalid config format" };
     }
-    // Normalize button array
-    var buttons = [];
-    for (var i = 0; i < BUTTON_COUNT; i++) {
-      var btn = emptyButton(i);
-      if (parsed.buttons && parsed.buttons[i]) {
-        var src = parsed.buttons[i];
-        if (typeof src.label === "string") btn.label = src.label;
-        if (typeof src.icon_path === "string") btn.icon_path = src.icon_path;
-        if (typeof src.action_type === "string") btn.action_type = src.action_type;
-        if (typeof src.action_value === "string") btn.action_value = src.action_value;
-      }
-      buttons.push(btn);
+
+    // v1: flat 32-button array.
+    if (parsed.version === 1 || (!parsed.profiles && Array.isArray(parsed.buttons))) {
+      var legacy = Array.isArray(parsed.buttons) ? parsed.buttons : [];
+      var xl = normalizeProfile({ buttons: legacy }, "xl", "Stream Deck XL", "xl");
+      var orig = normalizeProfile({ buttons: legacy }, "original", "Stream Deck Original", "original");
+      return {
+        config: {
+          version: SCHEMA_VERSION,
+          activeProfileId: "xl",
+          profiles: [xl, orig],
+          defaults: { xl: "xl", original: "original" }
+        },
+        error: ""
+      };
     }
+
+    // v2: profiles keyed by layout key.
+    if (parsed.version === 2 && parsed.profiles && !Array.isArray(parsed.profiles)) {
+      var p2 = parsed.profiles;
+      var xl2 = normalizeProfile(p2.xl, "xl", "Stream Deck XL", "xl");
+      var orig2 = normalizeProfile(p2.original, "original", "Stream Deck Original", "original");
+      return {
+        config: {
+          version: SCHEMA_VERSION,
+          activeProfileId: "xl",
+          profiles: [xl2, orig2],
+          defaults: { xl: "xl", original: "original" }
+        },
+        error: ""
+      };
+    }
+
+    // v3: array of profiles.
+    var profiles = [];
+    var srcProfiles = Array.isArray(parsed.profiles) ? parsed.profiles : [];
+    for (var i = 0; i < srcProfiles.length; i++) {
+      var sp = srcProfiles[i];
+      if (!sp || typeof sp !== "object") continue;
+      var layoutKey = (sp.layout && layoutByKey(sp.layout)) ? sp.layout : "xl";
+      profiles.push(normalizeProfile(sp, newProfileId(), "Profile", layoutKey));
+    }
+    if (profiles.length === 0) {
+      profiles = emptyConfig().profiles;
+    }
+
+    var activeId = (typeof parsed.activeProfileId === "string" && parsed.activeProfileId) ? parsed.activeProfileId : profiles[0].id;
+    // Ensure active id exists.
+    var activeExists = false;
+    for (var j = 0; j < profiles.length; j++) {
+      if (profiles[j].id === activeId) { activeExists = true; break; }
+    }
+    if (!activeExists) activeId = profiles[0].id;
+
+    var defaults = { xl: "", original: "" };
+    if (parsed.defaults && typeof parsed.defaults === "object") {
+      if (typeof parsed.defaults.xl === "string") defaults.xl = parsed.defaults.xl;
+      if (typeof parsed.defaults.original === "string") defaults.original = parsed.defaults.original;
+    }
+
     return {
-      config: { version: SCHEMA_VERSION, buttons: buttons },
+      config: {
+        version: SCHEMA_VERSION,
+        activeProfileId: activeId,
+        profiles: profiles,
+        defaults: defaults
+      },
       error: ""
     };
   } catch (e) {
@@ -80,43 +213,6 @@ function parseConfig(text) {
 
 function serializeConfig(config) {
   return JSON.stringify(config, null, 2);
-}
-
-function exampleConfig() {
-  return {
-    version: SCHEMA_VERSION,
-    buttons: [
-      { index: 0, label: "Terminal", icon_path: "", action_type: "command", action_value: "alacritty" },
-      { index: 1, label: "Browser", icon_path: "", action_type: "command", action_value: "firefox" },
-      { index: 2, label: "Files", icon_path: "", action_type: "command", action_value: "thunar" },
-      { index: 3, label: "Screenshot", icon_path: "", action_type: "command", action_value: "omarchy capture screenshot" },
-      { index: 4, label: "Menu", icon_path: "", action_type: "keybinding", action_value: "SUPER+ALT+Enter" },
-      { index: 5, label: "Lock", icon_path: "", action_type: "command", action_value: "omarchy system lock" },
-      { index: 6, label: "Music", icon_path: "", action_type: "command", action_value: "spotify" },
-      { index: 7, label: "Code", icon_path: "", action_type: "command", action_value: "code" },
-      // Row 2
-      { index: 8, label: "Vol -", icon_path: "", action_type: "command", action_value: "pamixer -d 5" },
-      { index: 9, label: "Mute", icon_path: "", action_type: "command", action_value: "pamixer -t" },
-      { index: 10, label: "Vol +", icon_path: "", action_type: "command", action_value: "pamixer -i 5" },
-      { index: 11, label: "Play", icon_path: "", action_type: "command", action_value: "playerctl play-pause" },
-      { index: 12, label: "Next", icon_path: "", action_type: "command", action_value: "playerctl next" },
-      { index: 13, label: "Prev", icon_path: "", action_type: "command", action_value: "playerctl previous" },
-      { index: 14, label: "Night", icon_path: "", action_type: "command", action_value: "omarchy toggle nightlight" },
-      { index: 15, label: "Theme", icon_path: "", action_type: "command", action_value: "omarchy-shell shell summon omarchy.theme-switcher" },
-    ]
-  };
-}
-
-function rowForIndex(index) {
-  return Math.floor(index / 8);
-}
-
-function colForIndex(index) {
-  return index % 8;
-}
-
-function indexFromRowCol(row, col) {
-  return row * 8 + col;
 }
 
 function hasAction(btn) {

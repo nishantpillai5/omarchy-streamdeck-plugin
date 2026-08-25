@@ -27,11 +27,36 @@ Panel {
   readonly property bool isReady: phase === "ready"
   readonly property bool hasError: phase === "error"
   readonly property string deckType: serviceReady ? service.deckType : ""
-  readonly property int deviceButtonCount: serviceReady ? service.deviceButtonCount : 32
+  readonly property string activeProfileId: serviceReady ? service.activeProfileId : ""
+  readonly property var profiles: serviceReady ? service.profiles : []
+  readonly property var defaults: serviceReady ? service.defaults : ({})
+  readonly property bool followDevice: serviceReady ? service.followDevice : true
+
+  // Display name of the active profile.
+  readonly property string activeProfileName: {
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].id === activeProfileId) return profiles[i].name;
+    }
+    return "";
+  }
+
+  // The profile currently selected in the manager (defaults to active).
+  readonly property var selectedProfile: {
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].id === selectedProfileId) return profiles[i];
+    }
+    return null;
+  }
+
+  readonly property bool selectedIsDefaultXl: selectedProfile ? (defaults.xl === selectedProfile.id) : false
+  readonly property bool selectedIsDefaultOriginal: selectedProfile ? (defaults.original === selectedProfile.id) : false
+
+  // Button count of the active profile (the grid shows/edits this profile).
+  readonly property int activeButtonCount: buttons.length > 0 ? buttons.length : 32
 
   // Layout: XL = 8×4 (32), Original/Original V2 = 5×3 (15)
-  readonly property int colCount: deviceButtonCount === 15 ? 5 : 8
-  readonly property int rowCount: deviceButtonCount === 15 ? 3 : 4
+  readonly property int colCount: activeButtonCount === 15 ? 5 : 8
+  readonly property int rowCount: activeButtonCount === 15 ? 3 : 4
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color accent: Color.accent
@@ -49,6 +74,13 @@ Panel {
   property string editActionDraft: ""
   property string editTypeDraft: "command"
   property string editIconDraft: ""
+
+  // ---------------------------------------------------------------- profile mgmt state
+  property bool profileManagerOpen: false
+  property string selectedProfileId: ""
+  property string nameDraft: ""
+  property string newProfileName: ""
+  property string newProfileLayout: "xl"
 
   // ---------------------------------------------------------------- cursor
   property int cursorIndex: 0
@@ -69,7 +101,7 @@ Panel {
   }
 
   function editButtonAt(index) {
-    if (index < 0 || index >= deviceButtonCount) return
+    if (index < 0 || index >= activeButtonCount) return
     editingIndex = index
     var btn = buttons[index] || Model.emptyButton(index)
     editLabelDraft = btn.label || ""
@@ -88,12 +120,40 @@ Panel {
       action_type: editTypeDraft,
       action_value: editActionDraft
     }
-    if (serviceReady) service.saveConfig(newButtons)
+    if (serviceReady) service.saveProfileButtons(activeProfileId, newButtons)
     editingIndex = -1
   }
 
   function cancelEdit() {
     editingIndex = -1
+  }
+
+  function openProfileManager() {
+    profileManagerOpen = true
+    selectedProfileId = activeProfileId
+    nameDraft = activeProfileName
+  }
+
+  function selectProfileForEdit(id) {
+    selectedProfileId = id
+    var p = null
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].id === id) { p = profiles[i]; break }
+    }
+    nameDraft = p ? p.name : ""
+  }
+
+  function commitRename() {
+    if (selectedProfileId !== "" && nameDraft.trim() !== "") {
+      if (serviceReady) service.renameProfile(selectedProfileId, nameDraft.trim())
+    }
+  }
+
+  function toggleDefault(layoutKey) {
+    if (!serviceReady || !selectedProfile) return
+    var current = defaults[layoutKey]
+    // Toggle: if this profile is already the default, clear it; otherwise set it.
+    service.setDefaultForLayout(layoutKey, current === selectedProfile.id ? "" : selectedProfile.id)
   }
 
   function openIconPicker() {
@@ -154,7 +214,7 @@ Panel {
     function toggle(): void { root.toggle() }
 
     function setButton(index, label, actionType, actionValue, iconPath): string {
-      if (index < 0 || index >= Model.BUTTON_COUNT) return "invalid index"
+      if (index < 0 || index >= root.activeButtonCount) return "invalid index"
       if (!serviceReady) return "service unavailable"
       var newButtons = buttons.slice()
       newButtons[index] = {
@@ -164,16 +224,16 @@ Panel {
         action_type: actionType || "command",
         action_value: actionValue || ""
       }
-      service.saveConfig(newButtons)
+      service.saveProfileButtons(root.activeProfileId, newButtons)
       return "ok"
     }
 
     function clearButton(index): string {
-      if (index < 0 || index >= Model.BUTTON_COUNT) return "invalid index"
+      if (index < 0 || index >= root.activeButtonCount) return "invalid index"
       if (!serviceReady) return "service unavailable"
       var newButtons = buttons.slice()
       newButtons[index] = Model.emptyButton(index)
-      service.saveConfig(newButtons)
+      service.saveProfileButtons(root.activeProfileId, newButtons)
       return "ok"
     }
 
@@ -196,7 +256,9 @@ Panel {
         error: root.lastError,
         brightness: root.brightness,
         deckType: root.deckType,
-        buttonCount: root.deviceButtonCount,
+        activeProfileId: root.activeProfileId,
+        followDevice: root.followDevice,
+        buttonCount: root.activeButtonCount,
         configured: buttons.filter(function(b) { return Model.hasAction(b) }).length
       })
     }
@@ -245,10 +307,21 @@ Panel {
         else if (lower === "e") root.activateCursor()
       }
 
-      Column {
-        id: contentColumn
+      Flickable {
+        id: panelFlick
         anchors.fill: parent
-        spacing: Style.spacing.md
+        contentWidth: width
+        contentHeight: contentColumn.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        Column {
+          id: contentColumn
+          width: panelFlick.width
+          spacing: Style.spacing.md
 
         // ---------- Header ----------
         PanelHero {
@@ -278,6 +351,325 @@ Panel {
                 onClicked: {
                   if (serviceReady) service.reconnect()
                 }
+              }
+            }
+          }
+        }
+
+        // ---------- Profile selector ----------
+        Column {
+          width: parent.width
+          visible: root.editingIndex < 0
+          spacing: Style.spacing.sm
+
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Text {
+              text: "Profile"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+              text: root.activeProfileName
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Button {
+              text: root.profileManagerOpen ? "Done" : "Manage"
+              bordered: true
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onClicked: {
+                if (root.profileManagerOpen) {
+                  root.profileManagerOpen = false
+                } else {
+                  root.openProfileManager()
+                }
+              }
+            }
+          }
+
+          // Profile manager (two-pane: list + detail)
+          Column {
+            width: parent.width
+            visible: root.profileManagerOpen
+            spacing: Style.spacing.md
+
+            // ---- List pane ----
+            Column {
+              width: parent.width
+              spacing: Style.spacing.xs
+
+              Repeater {
+                model: root.profiles
+
+                delegate: Rectangle {
+                  required property var modelData
+                  required property int index
+                  width: parent.width
+                  height: Style.space(36)
+                  radius: Style.cornerRadius
+                  color: modelData.id === root.selectedProfileId ? root.selectedFill : "transparent"
+                  border.width: modelData.id === root.activeProfileId ? 1 : 0
+                  border.color: root.accent
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.selectProfileForEdit(modelData.id)
+                  }
+
+                  Row {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(10)
+                    anchors.rightMargin: Style.space(10)
+                    spacing: Style.spacing.sm
+
+                    Text {
+                      text: modelData.name
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: modelData.id === root.activeProfileId
+                      anchors.verticalCenter: parent.verticalCenter
+                      elide: Text.ElideRight
+                      width: parent.width - Style.space(120)
+                    }
+
+                    Text {
+                      text: modelData.layout === "xl" ? "XL" : "Orig"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      visible: modelData.id === root.activeProfileId
+                      text: "✓"
+                      color: root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: true
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+              }
+
+              // New profile row
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                TextField {
+                  width: parent.width - Style.space(200)
+                  text: root.newProfileName
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  placeholderText: "New profile name"
+                  onTextChanged: root.newProfileName = text
+                }
+
+                Button {
+                  text: "XL"
+                  selected: root.newProfileLayout === "xl"
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onClicked: root.newProfileLayout = "xl"
+                }
+
+                Button {
+                  text: "Orig"
+                  selected: root.newProfileLayout === "original"
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onClicked: root.newProfileLayout = "original"
+                }
+
+                Button {
+                  text: "+"
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onClicked: {
+                    if (serviceReady && root.newProfileName.trim() !== "") {
+                      var id = service.createProfile(root.newProfileName.trim(), root.newProfileLayout)
+                      root.newProfileName = ""
+                      root.selectProfileForEdit(id)
+                    }
+                  }
+                }
+              }
+            }
+
+            // ---- Detail pane (selected profile) ----
+            Column {
+              width: parent.width
+              visible: root.selectedProfile !== null
+              spacing: Style.spacing.sm
+
+              PanelSectionHeader {
+                text: "PROFILE"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              // Name
+              Column {
+                width: parent.width
+                spacing: Style.spacing.xs
+
+                Text {
+                  text: "Name"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+
+                TextField {
+                  width: parent.width
+                  text: root.nameDraft
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  onTextChanged: root.nameDraft = text
+                  onEditingFinished: root.commitRename()
+                }
+              }
+
+              // Layout (read-only)
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Text {
+                  text: "Layout"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                  text: root.selectedProfile ? (root.selectedProfile.layout === "xl" ? "Stream Deck XL (8×4)" : "Stream Deck Original (5×3)") : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+
+              // Default for
+              Column {
+                width: parent.width
+                spacing: Style.spacing.xs
+
+                Text {
+                  text: "Default for"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+
+                Row {
+                  width: parent.width
+                  spacing: Style.spacing.sm
+
+                  Button {
+                    text: "XL"
+                    selected: root.selectedIsDefaultXl
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    onClicked: root.toggleDefault("xl")
+                  }
+
+                  Button {
+                    text: "Original"
+                    selected: root.selectedIsDefaultOriginal
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    onClicked: root.toggleDefault("original")
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  text: "When a device connects, its default profile is applied automatically."
+                }
+              }
+
+              // Actions
+              Row {
+                width: parent.width
+                spacing: Style.spacing.sm
+
+                Button {
+                  text: "Apply"
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onClicked: {
+                    if (serviceReady && root.selectedProfile) service.applyProfile(root.selectedProfile.id)
+                  }
+                }
+
+                Button {
+                  text: "↑"
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  onClicked: { if (serviceReady && root.selectedProfile) service.moveProfile(root.selectedProfile.id, -1) }
+                }
+
+                Button {
+                  text: "↓"
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  onClicked: { if (serviceReady && root.selectedProfile) service.moveProfile(root.selectedProfile.id, 1) }
+                }
+
+                Button {
+                  text: "Delete"
+                  foreground: root.urgent
+                  fontFamily: root.fontFamily
+                  onClicked: {
+                    if (serviceReady && root.selectedProfile) {
+                      service.deleteProfile(root.selectedProfile.id)
+                      root.selectedProfileId = root.activeProfileId
+                    }
+                  }
+                }
+              }
+
+              Button {
+                visible: !root.followDevice
+                text: "Follow device"
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onClicked: { if (serviceReady) service.resumeFollowDevice() }
               }
             }
           }
@@ -369,7 +761,7 @@ Panel {
             spacing: Style.spacing.sm
 
             Repeater {
-              model: root.deviceButtonCount
+              model: root.activeButtonCount
 
               delegate: Rectangle {
                 required property int index
@@ -441,7 +833,7 @@ Panel {
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
-            text: "Connect your Stream Deck XL via USB. Make sure udev rules are installed for non-root access."
+            text: "Connect your Stream Deck via USB. Make sure udev rules are installed for non-root access."
           }
 
           Button {
@@ -681,6 +1073,7 @@ Panel {
               onClicked: root.cancelEdit()
             }
           }
+        }
         }
       }
     }
