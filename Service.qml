@@ -98,13 +98,17 @@ QtObject {
     configFile.setText(text)
   }
 
-  function pushButtons() {
+  function pushButtons(buttonsArg) {
     console.log("[StreamDeck Service] pushButtons called, bridge running:", bridgeController.running)
     if (!bridgeController.running) {
       console.log("[StreamDeck Service] Bridge not running, aborting")
       return
     }
-    var list = buttons
+    // Accept an explicit button list (e.g. freshly-saved buttons) to avoid the
+    // stale-binding problem: mutating a nested property of `profiles` does not
+    // re-evaluate the `buttons` binding, so callers that just changed buttons
+    // pass them in directly.
+    var list = buttonsArg !== undefined ? buttonsArg : buttons
     var activeButtons = list.filter(function(b) { return Model.hasAction(b) })
     console.log("[StreamDeck Service] Sending", activeButtons.length, "buttons to bridge")
     var sent = bridgeController.send({ op: "set_buttons", buttons: activeButtons })
@@ -214,7 +218,7 @@ QtObject {
     if (!p) return
     p.buttons = newButtons
     if (profileId === activeProfileId && isReady && bridgeController.running) {
-      pushButtons()
+      pushButtons(newButtons)
     }
     saveConfig()
   }
