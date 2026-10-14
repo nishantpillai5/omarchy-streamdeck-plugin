@@ -38,7 +38,8 @@ function setHomeDir(home) {
 // grid and the number of button slots a profile holds.
 var LAYOUTS = [
   { key: "xl", label: "Stream Deck XL", buttonCount: 32, cols: 8, rows: 4 },
-  { key: "original", label: "Stream Deck Original", buttonCount: 15, cols: 5, rows: 3 }
+  { key: "original", label: "Stream Deck Original", buttonCount: 15, cols: 5, rows: 3 },
+  { key: "plus", label: "Stream Deck +", buttonCount: 8, cols: 4, rows: 2, dials: 4, touchStrip: true }
 ];
 
 function layoutByKey(key) {
@@ -50,6 +51,7 @@ function layoutByKey(key) {
 
 function layoutKeyForDeckType(deckType) {
   var t = String(deckType || "");
+  if (t.indexOf("+") >= 0) return "plus";
   if (t.indexOf("XL") >= 0) return "xl";
   if (t.indexOf("Original") >= 0) return "original";
   return "xl";
@@ -87,17 +89,19 @@ function newProfile(name, layoutKey) {
   };
 }
 
-// A fresh config with two starter profiles (one per layout).
+// A fresh config with three starter profiles (one per layout).
 function emptyConfig() {
   var xl = newProfile("Stream Deck XL", "xl");
   xl.id = "xl";
   var orig = newProfile("Stream Deck Original", "original");
   orig.id = "original";
+  var plus = newProfile("Stream Deck +", "plus");
+  plus.id = "plus";
   return {
     version: SCHEMA_VERSION,
     activeProfileId: "xl",
-    profiles: [xl, orig],
-    defaults: { xl: "xl", original: "original" }
+    profiles: [xl, orig, plus],
+    defaults: { xl: "xl", original: "original", plus: "plus" }
   };
 }
 
@@ -148,7 +152,7 @@ function parseConfig(text) {
           version: SCHEMA_VERSION,
           activeProfileId: "xl",
           profiles: [xl, orig],
-          defaults: { xl: "xl", original: "original" }
+          defaults: { xl: "xl", original: "original", plus: "" }
         },
         error: ""
       };
@@ -164,7 +168,7 @@ function parseConfig(text) {
           version: SCHEMA_VERSION,
           activeProfileId: "xl",
           profiles: [xl2, orig2],
-          defaults: { xl: "xl", original: "original" }
+          defaults: { xl: "xl", original: "original", plus: "" }
         },
         error: ""
       };
@@ -191,10 +195,11 @@ function parseConfig(text) {
     }
     if (!activeExists) activeId = profiles[0].id;
 
-    var defaults = { xl: "", original: "" };
+    var defaults = { xl: "", original: "", plus: "" };
     if (parsed.defaults && typeof parsed.defaults === "object") {
       if (typeof parsed.defaults.xl === "string") defaults.xl = parsed.defaults.xl;
       if (typeof parsed.defaults.original === "string") defaults.original = parsed.defaults.original;
+      if (typeof parsed.defaults.plus === "string") defaults.plus = parsed.defaults.plus;
     }
 
     return {
@@ -216,11 +221,14 @@ function serializeConfig(config) {
 }
 
 function hasAction(btn) {
-  return btn && btn.action_value && btn.action_value.trim().length > 0;
+  if (!btn) return false;
+  if (btn.action_type === "audio_output") return true;
+  return btn.action_value && btn.action_value.trim().length > 0;
 }
 
 function actionSummary(btn) {
   if (!hasAction(btn)) return "empty";
+  if (btn.action_type === "audio_output") return "audio output";
   var type = btn.action_type === "keybinding" ? "key" : "cmd";
   return type + ": " + btn.action_value;
 }

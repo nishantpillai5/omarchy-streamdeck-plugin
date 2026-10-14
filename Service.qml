@@ -31,7 +31,7 @@ QtObject {
   // Profile state.
   property var profiles: []            // array of { id, name, layout, buttons }
   property string activeProfileId: ""  // profile currently shown/edited/pushed
-  property var defaults: ({})          // { xl: profileId, original: profileId }
+  property var defaults: ({})          // { xl: profileId, original: profileId, plus: profileId }
   property bool followDevice: true     // auto-apply the per-device default on connect
 
   readonly property bool isReady: phase === "ready"
@@ -168,6 +168,7 @@ QtObject {
     // Clear any default pointing at the deleted profile.
     if (defaults.xl === id) defaults.xl = ""
     if (defaults.original === id) defaults.original = ""
+    if (defaults.plus === id) defaults.plus = ""
     if (activeProfileId === id) {
       activeProfileId = profiles[0].id
       if (isReady && bridgeController.running) pushButtons()
@@ -255,6 +256,18 @@ QtObject {
       root.phase = "error"
       root.lastError = event.message || "Unknown error"
       break
+    case "swipe": {
+      // Page between profiles: swipe left -> next, right -> previous (wraps).
+      var dir = (event.direction === undefined) ? 0 : event.direction
+      if (dir === 0 || root.profiles.length < 2) break
+      var idx = root.profileIndexById(root.activeProfileId)
+      if (idx < 0) idx = 0
+      var next = idx + dir
+      if (next < 0) next = root.profiles.length - 1
+      if (next >= root.profiles.length) next = 0
+      if (next !== idx) root.applyProfile(root.profiles[next].id)
+      break
+    }
     case "button_down":
       break
     case "button_up":

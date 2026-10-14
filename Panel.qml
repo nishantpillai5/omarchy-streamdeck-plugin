@@ -50,13 +50,30 @@ Panel {
 
   readonly property bool selectedIsDefaultXl: selectedProfile ? (defaults.xl === selectedProfile.id) : false
   readonly property bool selectedIsDefaultOriginal: selectedProfile ? (defaults.original === selectedProfile.id) : false
+  readonly property bool selectedIsDefaultPlus: selectedProfile ? (defaults.plus === selectedProfile.id) : false
+
+  // The profile object that is active (pushed to the device).
+  readonly property var activeProfileObj: {
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].id === activeProfileId) return profiles[i];
+    }
+    return profiles.length > 0 ? profiles[0] : null;
+  }
+  readonly property string activeLayoutKey: activeProfileObj ? activeProfileObj.layout : "xl"
 
   // Button count of the active profile (the grid shows/edits this profile).
   readonly property int activeButtonCount: buttons.length > 0 ? buttons.length : 32
 
-  // Layout: XL = 8×4 (32), Original/Original V2 = 5×3 (15)
-  readonly property int colCount: activeButtonCount === 15 ? 5 : 8
-  readonly property int rowCount: activeButtonCount === 15 ? 3 : 4
+  // Layout dimensions follow the active profile's layout.
+  readonly property int colCount: {
+    var l = Model.layoutByKey(root.activeLayoutKey)
+    return l ? l.cols : 8
+  }
+  readonly property int rowCount: {
+    var l = Model.layoutByKey(root.activeLayoutKey)
+    return l ? l.rows : 4
+  }
+  readonly property bool isPlus: root.activeLayoutKey === "plus"
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color accent: Color.accent
@@ -448,7 +465,7 @@ Panel {
                     }
 
                     Text {
-                      text: modelData.layout === "xl" ? "XL" : "Orig"
+                      text: modelData.layout === "xl" ? "XL" : (modelData.layout === "plus" ? "+" : "Orig")
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -499,6 +516,15 @@ Panel {
                   accent: root.accent
                   fontFamily: root.fontFamily
                   onClicked: root.newProfileLayout = "original"
+                }
+
+                Button {
+                  text: "+"
+                  selected: root.newProfileLayout === "plus"
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onClicked: root.newProfileLayout = "plus"
                 }
 
                 Button {
@@ -567,7 +593,9 @@ Panel {
                 }
 
                 Text {
-                  text: root.selectedProfile ? (root.selectedProfile.layout === "xl" ? "Stream Deck XL (8×4)" : "Stream Deck Original (5×3)") : ""
+                  text: root.selectedProfile ? (root.selectedProfile.layout === "xl" ? "Stream Deck XL (8×4)"
+                       : root.selectedProfile.layout === "plus" ? "Stream Deck + (4×2, 4 dials, touch strip)"
+                       : "Stream Deck Original (5×3)") : ""
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -608,6 +636,15 @@ Panel {
                     accent: root.accent
                     fontFamily: root.fontFamily
                     onClicked: root.toggleDefault("original")
+                  }
+
+                  Button {
+                    text: "+"
+                    selected: root.selectedIsDefaultPlus
+                    foreground: root.foreground
+                    accent: root.accent
+                    fontFamily: root.fontFamily
+                    onClicked: root.toggleDefault("plus")
                   }
                 }
 
@@ -786,7 +823,9 @@ Panel {
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
                   onContainsMouseChanged: if (containsMouse) root.cursorIndex = index
-                  onClicked: root.editButtonAt(index)
+                  onClicked: {
+                    root.editButtonAt(index)
+                  }
                 }
 
                 Column {
@@ -798,11 +837,11 @@ Panel {
                     width: parent.width
                     horizontalAlignment: Text.AlignHCenter
                     elide: Text.ElideRight
-                    color: Model.hasAction(btn) ? root.foreground : root.dim
+                    color: (Model.hasAction(btn) ? root.foreground : root.dim)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: Model.hasAction(btn)
-                    text: btn.label || String(index + 1)
+                    text: (btn.label || String(index + 1))
                   }
 
                   Text {
@@ -818,6 +857,152 @@ Panel {
                 }
               }
             }
+          }
+        }
+
+        // ---------- Touch strip & dials (Stream Deck +) ----------
+        Column {
+          width: parent.width
+          visible: root.editingIndex < 0 && root.isPlus && root.isReady
+          spacing: Style.spacing.md
+
+          PanelSectionHeader {
+            text: "TOUCH STRIP & DIALS"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          // Touch strip: four 200x100 sections, leftmost is the volume tile
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Rectangle {
+              width: (parent.width - 3 * Style.spacing.sm) / 4
+              height: Style.space(44)
+              radius: Style.cornerRadius
+              color: Qt.darker(root.accent, 2.5)
+              border.width: 1
+              border.color: root.accent
+
+              Text {
+                anchors.centerIn: parent
+                text: "Volume · tap = mute"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            Rectangle {
+              width: (parent.width - 3 * Style.spacing.sm) / 4
+              height: Style.space(44)
+              radius: Style.cornerRadius
+              color: Qt.darker(root.accent, 2.5)
+              border.width: 1
+              border.color: root.accent
+
+              Text {
+                anchors.centerIn: parent
+                text: "App · tap = mute"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            Rectangle {
+              width: (parent.width - 3 * Style.spacing.sm) / 4
+              height: Style.space(44)
+              radius: Style.cornerRadius
+              color: Qt.darker(root.accent, 2.5)
+              border.width: 1
+              border.color: root.accent
+
+              Text {
+                anchors.centerIn: parent
+                text: "Mic · tap = mute"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+
+            Repeater {
+              model: 1
+              delegate: Rectangle {
+                width: (parent.width - 3 * Style.spacing.sm) / 4
+                height: Style.space(44)
+                radius: Style.cornerRadius
+                color: Color.background
+                border.width: 1
+                border.color: Qt.darker(Color.background, 1.3)
+
+                Text {
+                  anchors.centerIn: parent
+                  text: "—"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+
+          // Dials
+          Row {
+            width: parent.width
+            spacing: Style.spacing.sm
+
+            Repeater {
+              model: 4
+              delegate: Column {
+                required property int index
+                width: (parent.width - 3 * Style.spacing.sm) / 4
+                spacing: Style.spacing.xxs
+
+                Rectangle {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  width: Style.space(36)
+                  height: width
+                  radius: width / 2
+                  color: Qt.darker(root.accent, 2.5)
+                  border.width: 1
+                  border.color: root.accent
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: "◍"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  horizontalAlignment: Text.AlignHCenter
+                  elide: Text.ElideRight
+                  color: root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  text: index === 0 ? "Volume" : (index === 1 ? "App" : (index === 2 ? "Mic" : "Call"))
+                }
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            text: "Left dial: turn = volume, push = mute. Second dial: turn = focused app volume, push = mute app. Third dial: turn = mic level, push = mic mute. Fourth dial: turn = pinned-app call volume (auto-detects Element/Discord), push = mute it. Tap a tile on the touch strip to toggle its mute."
           }
         }
 
@@ -921,12 +1106,19 @@ Panel {
                 checked: root.editTypeDraft === "keybinding"
                 onCheckedChanged: if (checked) root.editTypeDraft = "keybinding"
               }
+
+              RadioButton {
+                text: "Audio out"
+                checked: root.editTypeDraft === "audio_output"
+                onCheckedChanged: if (checked) root.editTypeDraft = "audio_output"
+              }
             }
           }
 
           Column {
             width: parent.width
             spacing: Style.spacing.sm
+            visible: root.editTypeDraft !== "audio_output"
 
             Text {
               text: root.editTypeDraft === "command" ? "Shell command" : "Key combo"
@@ -956,6 +1148,16 @@ Panel {
               placeholderText: root.editTypeDraft === "command" ? "alacritty" : "SUPER+ALT+Enter"
               onTextChanged: root.editActionDraft = text
             }
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            visible: root.editTypeDraft === "audio_output"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            text: "Cycles the default audio output on press. The key label always shows the current device."
           }
 
           // ---------- Icon upload ----------

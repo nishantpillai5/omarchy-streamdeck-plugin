@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -62,6 +63,7 @@ def log(msg):
 
 try:
     from StreamDeck.DeviceManager import DeviceManager
+    from StreamDeck.Devices.StreamDeck import DialEventType, TouchscreenEventType
     from StreamDeck.ImageHelpers import PILHelper
     from PIL import Image, ImageDraw, ImageFont
 except ImportError as exc:
@@ -72,6 +74,15 @@ except ImportError as exc:
 # Defaults for when no device is connected yet (XL).
 ICON_SIZE = 96
 BUTTON_COUNT = 32
+AUDIO_KEY = 4        # reserved: cycle default audio output
+PINNED_APPS = [
+    # "Discord" is Omarchy's web-app Discord (discord.com in Brave), so its
+    # call audio comes out as a Brave stream — match the browser process.
+    {"label": "Element", "mode": "element", "terms": ["element", "element-desktop", "vector", "io.element"]},
+    {"label": "Discord", "mode": "discord", "terms": ["brave", "brave-browser", "chromium"]},
+]
+SWIPE_MIN_PX = 60   # min horizontal px for a strip swipe to page between profiles
+ICON_GLYPH_SIZE = 48  # rendered size of key icon glyphs (kept uniform across keys)
 
 class StreamDeckBridge:
     def __init__(self):
@@ -86,9 +97,13 @@ class StreamDeckBridge:
             "accent": "#ff7700",
         }
         self.brightness = 50
-        self._lock = threading.Lock()
+        self._magnitude_fast_until = 0.0
+        self._last_magnitude_state = "off"
+        self._lock = threading.RLock()
+        self._official_icon_cache: dict = {}
         self._font: ImageFont.FreeTypeFont | None = None
         self._cached_icons: dict[int, bytes] = {}
+        self._cache_keys: dict[int, str] = {}
 
     def _icon_size(self) -> tuple[int, int]:
         """Return (width, height) of a key image for the current device."""
@@ -123,12 +138,52 @@ class StreamDeckBridge:
         for path in candidates:
             if os.path.isfile(path):
                 try:
+                    self._font_path = path
                     self._font = ImageFont.truetype(path, 18)
                     return
                 except Exception:
                     pass
         # Fallback to default bitmap font
         self._font = ImageFont.load_default()
+
+    def _get_font(self, size: int):
+        """Load a font at an arbitrary size, falling back to the label font."""
+        if getattr(self, "_font_path", None) and os.path.isfile(self._font_path):
+            try:
+                return ImageFont.truetype(self._font_path, size)
+            except Exception:
+                pass
+        self._ensure_font()
+        return self._font
+
+    def _render_official_icon(self, name: str, color_hex: str, size: int):
+        """Render an official Elgato SVG icon tinted with the given color.
+
+        Returns a PIL RGBA image, or None if unavailable (callers fall back
+        to drawn icons).
+        """
+        import tempfile
+        cache_key = (name, color_hex, size)
+        if cache_key in self._official_icon_cache:
+            return self._official_icon_cache[cache_key]
+        svg_path = os.path.expanduser(f"~/.config/omarchy/streamdeck/icons/{name}")
+        if not os.path.isfile(svg_path):
+            return None
+        try:
+            svg = open(svg_path).read().replace("currentColor", color_hex)
+            with tempfile.NamedTemporaryFile("w", suffix=".svg", delete=False) as f:
+                f.write(svg)
+                svg_tmp = f.name
+            png_tmp = svg_tmp[:-4] + ".png"
+            subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(size), svg_tmp, "-o", png_tmp],
+                           check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            img = Image.open(png_tmp).convert("RGBA")
+            os.unlink(svg_tmp)
+            os.unlink(png_tmp)
+            self._official_icon_cache[cache_key] = img
+            return img
+        except Exception:
+            return None
 
     def _hex_to_rgb(self, hex_color: str) -> tuple[int, int, int]:
         hex_color = hex_color.lstrip("#")
@@ -182,6 +237,133 @@ class StreamDeckBridge:
 
         return PILHelper.to_native_format(self.deck, img)
 
+    def _generate_audio_icon(self, device_name: str) -> bytes:
+        """Composite icon for the audio output key: volume/speaker icon with the
+        current device name just below it. Black background and no border, to
+        match the official-icon keys."""
+        self._ensure_font()
+        w, h = self._icon_size()
+        fg = self._hex_to_rgb(self.colors.get("fg", "#ffffff"))
+
+        img = Image.new("RGB", (w, h), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Wrap the device name to at most 2 lines first, so the icon can sit
+        # just above the (bottom-anchored) text with a tight gap.
+        font = self._get_font(14)
+        lines = []
+        if device_name and font is not None:
+            max_width = w - 12
+            words = device_name.split()
+            current = ""
+            for word in words:
+                test = current + " " + word if current else word
+                bbox = draw.textbbox((0, 0), test, font=font)
+                if bbox[2] - bbox[0] <= max_width:
+                    current = test
+                else:
+                    if current:
+                        lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+            lines = lines[:2]
+            def too_long(s):
+                b = draw.textbbox((0, 0), s, font=font)
+                return b[2] - b[0] > max_width
+            if lines and too_long(lines[-1]):
+                s = lines[-1]
+                while s and too_long(s + "\u2026"):
+                    s = s[:-1]
+                lines[-1] = s + "\u2026"
+
+        line_height = 15
+        bottom_margin = 6
+        gap = 4
+        icon_size = ICON_GLYPH_SIZE
+        text_height = len(lines) * line_height
+        y_text = h - bottom_margin - text_height
+        icon_top = y_text - gap - icon_size
+        if icon_top < 4:
+            icon_top = 4
+
+        icon = self._render_official_icon("volume.svg", "#%02x%02x%02x" % fg, icon_size)
+        if icon is not None:
+            icon = icon.convert("RGBA")
+            img.paste(icon, ((w - icon.width) // 2, icon_top), icon)
+
+        y = y_text
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            x = (w - (bbox[2] - bbox[0])) // 2
+            draw.text((x, y), line, font=font, fill=fg)
+            y += line_height
+
+        return PILHelper.to_native_format(self.deck, img)
+
+    def _generate_magnitude_icon(self, label: str) -> bytes:
+        """Composite icon for the magnitude key: server glyph above the current
+        model name + residency state. Black background and no border, to
+        match the official-icon keys (same layout as the audio key)."""
+        self._ensure_font()
+        w, h = self._icon_size()
+        fg = self._hex_to_rgb(self.colors.get("fg", "#ffffff"))
+
+        img = Image.new("RGB", (w, h), (0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Wrap the label to at most 2 lines, mirroring the audio key layout.
+        font = self._get_font(14)
+        lines = []
+        if label and font is not None:
+            max_width = w - 12
+            words = label.split()
+            current = ""
+            for word in words:
+                test = current + " " + word if current else word
+                bbox = draw.textbbox((0, 0), test, font=font)
+                if bbox[2] - bbox[0] <= max_width:
+                    current = test
+                else:
+                    if current:
+                        lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+            lines = lines[:2]
+            def too_long(s):
+                b = draw.textbbox((0, 0), s, font=font)
+                return b[2] - b[0] > max_width
+            if lines and too_long(lines[-1]):
+                s = lines[-1]
+                while s and too_long(s + "\u2026"):
+                    s = s[:-1]
+                lines[-1] = s + "\u2026"
+
+        line_height = 15
+        bottom_margin = 6
+        gap = 4
+        icon_size = ICON_GLYPH_SIZE
+        text_height = len(lines) * line_height
+        y_text = h - bottom_margin - text_height
+        icon_top = y_text - gap - icon_size
+        if icon_top < 4:
+            icon_top = 4
+
+        icon = self._render_official_icon("server.svg", "#%02x%02x%02x" % fg, icon_size)
+        if icon is not None:
+            icon = icon.convert("RGBA")
+            img.paste(icon, ((w - icon.width) // 2, icon_top), icon)
+
+        y = y_text
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            x = (w - (bbox[2] - bbox[0])) // 2
+            draw.text((x, y), line, font=font, fill=fg)
+            y += line_height
+
+        return PILHelper.to_native_format(self.deck, img)
+
     def _get_icon(self, btn: dict) -> bytes:
         """Get icon bytes for a button, using custom path or generating one."""
         index = btn["index"]
@@ -189,24 +371,65 @@ class StreamDeckBridge:
         w, h = self._icon_size()
 
         if icon_path and os.path.isfile(icon_path):
-            try:
-                img = Image.open(icon_path)
-                img = img.convert("RGB")
-                img = img.resize((w, h), Image.LANCZOS)
-                return PILHelper.to_native_format(self.deck, img)
-            except Exception:
-                pass
+            if icon_path.lower().endswith(".svg"):
+                # Official Elgato SVG: render the glyph at a uniform size, tinted
+                # with the foreground color, centered on a black background.
+                name = os.path.basename(icon_path)
+                glyph = self._render_official_icon(name, self.colors.get("fg", "#ffffff"), ICON_GLYPH_SIZE)
+                if glyph is not None:
+                    canvas = Image.new("RGB", (w, h), (0, 0, 0))
+                    glyph = glyph.convert("RGBA")
+                    canvas.paste(glyph, ((w - glyph.width) // 2, (h - glyph.height) // 2), glyph)
+                    return PILHelper.to_native_format(self.deck, canvas)
+            else:
+                try:
+                    img = Image.open(icon_path)
+                    img = img.convert("RGB")
+                    img = img.resize((w, h), Image.LANCZOS)
+                    return PILHelper.to_native_format(self.deck, img)
+                except Exception:
+                    pass
 
         # Generate themed icon
         label = btn.get("label", "")
+        if btn.get("action_type") == "audio_output":
+            # Audio output key: always show the current default device name.
+            label = self._audio_label()
+        elif btn.get("action_type") == "magnitude":
+            # Magnitude key: always show the current model + residency state.
+            label = self._magnitude_label()
         cache_key = f"{label}:{self.colors.get('fg')}:{self.colors.get('bg')}:{self.colors.get('accent')}"
-        if index in self._cached_icons and self._cached_icons.get("_key") == cache_key:
+        if index in self._cached_icons and self._cache_keys.get(index) == cache_key:
             return self._cached_icons[index]
 
-        icon = self._generate_icon(label)
+        if btn.get("action_type") == "audio_output":
+            icon = self._generate_audio_icon(label)
+        elif btn.get("action_type") == "magnitude":
+            icon = self._generate_magnitude_icon(label)
+        else:
+            icon = self._generate_icon(label)
         self._cached_icons[index] = icon
-        self._cached_icons["_key"] = cache_key
+        self._cache_keys[index] = cache_key
         return icon
+
+    def _set_key_image(self, index: int, image: bytes):
+        """Thread-safe key image write.
+
+        The device reader thread (key/dial/touch callbacks) and the main command
+        thread both push key images; serialize the HID writes so they never
+        interleave on the USB pipe.
+        """
+        if not self.deck:
+            return
+        with self._lock:
+            self.deck.set_key_image(index, image)
+
+    def _set_touchscreen_image(self, data: bytes, x: int, y: int, w: int, h: int):
+        """Thread-safe touch-strip image write (see _set_key_image)."""
+        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+            return
+        with self._lock:
+            self.deck.set_touchscreen_image(data, x, y, w, h)
 
     def _update_button(self, index: int):
         """Push a single button's image to the hardware."""
@@ -221,11 +444,11 @@ class StreamDeckBridge:
         if not btn:
             # Clear button
             img = Image.new("RGB", (w, h), (0, 0, 0))
-            self.deck.set_key_image(index, PILHelper.to_native_format(self.deck, img))
+            self._set_key_image(index, PILHelper.to_native_format(self.deck, img))
             return
         try:
             icon = self._get_icon(btn)
-            self.deck.set_key_image(index, icon)
+            self._set_key_image(index, icon)
         except Exception as exc:
             log(json.dumps({"ev": "error", "message": f"set_key_image[{index}]: {exc}"}))
 
@@ -238,6 +461,207 @@ class StreamDeckBridge:
         for index in range(self._button_count()):
             self._update_button(index)
         log(json.dumps({"ev": "debug", "msg": "All buttons updated"}))
+
+    def _list_sinks(self):
+        """List audio output sinks as (name, description) tuples."""
+        try:
+            out = subprocess.run(["pactl", "list", "sinks"], capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            return []
+        sinks, name = [], None
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("Name:"):
+                name = s.split(":", 1)[1].strip()
+            elif s.startswith("Description:") and name:
+                sinks.append((name, s.split(":", 1)[1].strip()))
+                name = None
+        return sinks
+
+    def _default_sink(self):
+        """Get the current default audio output sink name."""
+        try:
+            out = subprocess.run(["pactl", "get-default-sink"],
+                                 capture_output=True, text=True, timeout=2).stdout.strip()
+            if out:
+                return out
+        except Exception:
+            pass
+        try:
+            out = subprocess.run(["wpctl", "status"], capture_output=True, text=True, timeout=3).stdout
+            for line in out.splitlines():
+                if "Audio/Sink" in line:
+                    return line.split()[-1]
+        except Exception:
+            pass
+        return None
+
+    def _audio_label(self):
+        """Short, recognizable name for the current default output device."""
+        name = self._default_sink()
+        label = name or "Audio"
+        for n, d in self._list_sinks():
+            if n == name:
+                m = re.search(r"\[([^\]]+)\]\s*$", d)
+                label = m.group(1) if m else d
+                break
+        if len(label) > 28:
+            label = label[:28].rsplit(" ", 1)[0].rstrip(",/- ")
+        return label
+
+    def _maybe_refresh_audio_keys(self):
+        """Redraw audio_output keys, but only when the default sink changed."""
+        indices = [i for i, b in self.buttons.items() if b.get("action_type") == "audio_output"]
+        if not indices:
+            return
+        label = self._audio_label()
+        if label == getattr(self, "_last_audio_label", None):
+            return
+        self._last_audio_label = label
+        for i in indices:
+            self._update_button(i)
+        log(json.dumps({"ev": "audio_key", "label": label}))
+
+    _MAGNITUDE_CLI = "/usr/lib/magnitude-desktop/resources/magnitude"
+
+    def _worker_alive(self):
+        """True while the inference worker process (and its VRAM) exists."""
+        try:
+            return subprocess.run(["pgrep", "-f", "magnitude-inference.*inference-worker"],
+                                  capture_output=True, timeout=3).returncode == 0
+        except Exception:
+            return False
+
+    def _magnitude_state(self):
+        """Return (name, state) of Magnitude's primary local model.
+
+        state is "on" (resident in VRAM), "off", or the raw runtime text
+        for transitional states (e.g. "Loading weights 43%", "Stopping").
+        """
+        model_id = ""
+        try:
+            with open(os.path.expanduser("~/.magnitude/state/models.json")) as f:
+                model_id = json.load(f).get("slots", {}).get("primary", {}).get("providerModelId", "")
+        except Exception:
+            pass
+        if not model_id:
+            return "Magnitude", "off"
+        name, state = model_id, "off"
+        try:
+            out = subprocess.run([self._MAGNITUDE_CLI, "models", "status", model_id],
+                                 capture_output=True, text=True, timeout=6).stdout
+            runtime = None
+            for line in out.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if name == model_id:
+                    name = s
+                if s.startswith("Runtime"):
+                    runtime = s.split(":", 1)[1].strip()
+            if runtime is not None:
+                r = runtime.lower()
+                if r == "ready":
+                    state = "on"
+                elif r in ("unloaded", "stopped"):
+                    # The service has no "stopping" state, but the worker
+                    # (and its VRAM) lingers briefly after the transition.
+                    state = "Stopping" if self._worker_alive() else "off"
+                else:
+                    # Transitional: Preparing, Loading <pct>%, Finalizing, ...
+                    state = runtime
+        except Exception:
+            # CLI unavailable: fall back to process-based residency check.
+            if self._worker_alive():
+                state = "on"
+            elif subprocess.run(["pgrep", "-f", "magnitude models load"],
+                                capture_output=True, timeout=3).returncode == 0:
+                state = "Loading"
+        return name, state
+
+    def _magnitude_label(self):
+        name, state = self._magnitude_state()
+        tag = {"on": "ON", "off": "OFF"}.get(state, state.upper())
+        return f"{name} {tag}"
+
+    def _magnitude_fast_polling(self):
+        """True while the magnitude key should poll at the fast interval.
+
+        Fast for ~15 s after a key press, and for as long as the model is in
+        a transitional state (loads of bigger models can take minutes).
+        """
+        if not any(b.get("action_type") == "magnitude" for b in self.buttons.values()):
+            return False
+        if time.time() < self._magnitude_fast_until:
+            return True
+        return self._last_magnitude_state not in ("on", "off")
+
+    def _maybe_refresh_magnitude_keys(self):
+        """Redraw magnitude keys, but only when the model state changed."""
+        indices = [i for i, b in self.buttons.items() if b.get("action_type") == "magnitude"]
+        if not indices:
+            return
+        name, state = self._magnitude_state()
+        tag = {"on": "ON", "off": "OFF"}.get(state, state.upper())
+        label = f"{name} {tag}"
+        if label == getattr(self, "_last_magnitude_label", None):
+            return
+        self._last_magnitude_label = label
+        self._last_magnitude_state = state
+        for i in indices:
+            self._update_button(i)
+        log(json.dumps({"ev": "magnitude_key", "label": label}))
+
+    def _update_audio_key(self):
+        """Show the current default audio output device name on key 4."""
+        if not self.deck:
+            return
+        name = self._default_sink()
+        label = name or "Audio"
+        for n, d in self._list_sinks():
+            if n == name:
+                # Prefer the short bracketed tag (e.g. [WaveShare-119]) if present,
+                # since that's how the device is recognized; else the description.
+                m = re.search(r"\[([^\]]+)\]\s*$", d)
+                label = m.group(1) if m else d
+                break
+        if len(label) > 28:
+            label = label[:28].rsplit(" ", 1)[0].rstrip(",/- ")
+        self.buttons[4] = {"index": 4, "label": label, "action_type": "command", "action_value": ""}
+        self._update_button(4)
+        log(json.dumps({"ev": "audio_key", "label": label}))
+
+    def _update_element_key(self):
+        """Reserved key 8 (index 7): launch/focus Element on press."""
+        if not self.deck:
+            return
+        self.buttons[7] = {"index": 7, "label": "Element",
+                           "action_type": "command", "action_value": "element-desktop"}
+        self._update_button(7)
+        log(json.dumps({"ev": "element_key", "label": "Element"}))
+
+    def _cycle_audio_output(self):
+        """Switch the default audio output to the next device.
+
+        Uses the official omarchy switcher so the rotation matches the
+        status bar exactly (same port-availability filter, order,
+        active-stream move, and OSD).
+        """
+        try:
+            subprocess.run(["omarchy-audio-output-switch"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            log(json.dumps({"ev": "audio_cycle"}))
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"audio cycle: {exc}"}))
+
+    def _handle_audio_cycle(self, index: int):
+        """Cycle the default audio output off the reader thread, then refresh
+        this key's label once the switch has completed."""
+        def work():
+            self._cycle_audio_output()
+            self._update_button(index)
+            self._last_audio_label = self._audio_label()
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_key_change(self, deck, key, state):
         """Callback when a Stream Deck key changes state."""
@@ -256,6 +680,508 @@ class StreamDeckBridge:
             self._last_press_time[key] = now
             self._handle_press(key)
 
+    def _focused_window(self):
+        """Return (class, title) of the focused window via hyprctl."""
+        try:
+            out = subprocess.run(["hyprctl", "activewindow", "-j"],
+                                 capture_output=True, text=True, timeout=2).stdout
+            data = json.loads(out)
+            return data.get("class", ""), data.get("title", "")
+        except Exception:
+            return "", ""
+
+    def _find_app_stream(self, app_class, title):
+        """Locate the audio stream (sink input) for the focused window's app.
+
+        Returns a dict {idx, volume, muted, name} or None if no match.
+        Parses `pactl list sink-inputs` blocks, matching the window
+        class/title against each stream's application properties
+        (PipeWire sets these instead of a plain Name: field).
+        """
+        try:
+            out = subprocess.run(["pactl", "list", "sink-inputs"],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            return None
+        cl = (app_class or "").lower().strip()
+        ti = (title or "").lower().strip()
+        best, best_score, best_block = None, 0, None
+        for block in re.split(r"(?=Sink Input #\d+)", out):
+            m = re.match(r"Sink Input #(\d+)", block)
+            if not m:
+                continue
+            cands = set()
+            for prop in ("application.name", "application.process.binary",
+                         "application.icon_name", "node.name"):
+                pm = re.search(rf'^\s*{re.escape(prop)}\s*=\s*"([^"]*)"', block, re.M)
+                if pm and pm.group(1).strip():
+                    cands.add(pm.group(1).strip().lower())
+            score = 0
+            for c in cands:
+                if c == cl:
+                    score = max(score, 100)
+                elif c and (c in cl or cl in c):
+                    score = max(score, 80)
+            if ti:
+                for c in cands:
+                    if c and (c in ti or ti in c):
+                        score = max(score, 50)
+            if score > best_score:
+                best, best_score, best_block = m.group(1), score, block
+        if best is None:
+            return None
+        volume = None
+        vm = re.search(r"Volume:.*?/\s*(\d+)%", best_block)
+        if vm:
+            volume = int(vm.group(1))
+        muted = bool(re.search(r"^\s*Mute:\s*yes", best_block, re.M))
+        name = None
+        nm = re.search(r'^\s*application.name\s*=\s*"([^"]*)"', best_block, re.M)
+        if nm:
+            name = nm.group(1)
+        return {"idx": best, "volume": volume, "muted": muted, "name": name}
+
+    def _on_dial(self, deck, dial, event_type, value):
+        """Callback when a Stream Deck dial is turned or pushed."""
+        if event_type == DialEventType.TURN:
+            # dial 0: system, 1: focused app, 2: mic, 3: pinned app
+            if dial not in (0, 1, 2, 3):
+                return
+            step = max(-20, min(20, int(value) * 2))
+            if step == 0:
+                return
+            sign = "+" if step > 0 else "-"
+            indicator = None
+            try:
+                if dial == 0:
+                    subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", f"{abs(step)}%{sign}"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_volume_indicator
+                elif dial == 2:
+                    subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SOURCE@", f"{abs(step)}%{sign}"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_mic_indicator
+                elif dial == 1:
+                    info = self._find_app_stream(*self._focused_window())
+                    if not info:
+                        log(json.dumps({"ev": "dial_turn", "dial": dial, "note": "no app stream"}))
+                        self._update_app_indicator()
+                        return
+                    cur = info["volume"] if info["volume"] is not None else 50
+                    new = max(0, min(100, cur + step))
+                    subprocess.run(["pactl", "set-sink-input-volume", info["idx"], f"{new}%"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_app_indicator
+                elif dial == 3:
+                    info = self._find_pinned_stream()
+                    if not info:
+                        log(json.dumps({"ev": "dial_turn", "dial": dial, "note": "no pinned stream",
+                                        "streams": self._debug_streams()}))
+                        self._update_pinned_indicator()
+                        return
+                    cur = info["volume"] if info["volume"] is not None else 50
+                    new = max(0, min(100, cur + step))
+                    subprocess.run(["pactl", "set-sink-input-volume", info["idx"], f"{new}%"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_pinned_indicator
+                log(json.dumps({"ev": "dial_turn", "dial": dial, "amount": value, "volume_change": step}))
+            except Exception as exc:
+                log(json.dumps({"ev": "error", "message": f"dial turn: {exc}"}))
+                return
+            if indicator:
+                indicator()
+        elif event_type == DialEventType.PUSH:
+            # dial 0: speaker mute, 1: focused app mute, 2: mic mute, 3: pinned app mute
+            if not value or dial not in (0, 1, 2, 3):
+                return
+            indicator = None
+            try:
+                if dial == 0:
+                    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_volume_indicator
+                elif dial == 2:
+                    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_mic_indicator
+                elif dial == 1:
+                    info = self._find_app_stream(*self._focused_window())
+                    if not info:
+                        self._update_app_indicator()
+                        return
+                    subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_app_indicator
+                elif dial == 3:
+                    info = self._find_pinned_stream()
+                    if not info:
+                        self._update_pinned_indicator()
+                        return
+                    subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    indicator = self._update_pinned_indicator
+                log(json.dumps({"ev": "dial_push", "dial": dial}))
+            except Exception as exc:
+                log(json.dumps({"ev": "error", "message": f"dial push: {exc}"}))
+                return
+            if indicator:
+                indicator()
+
+    def _on_touchscreen(self, deck, event_type, value):
+        """Callback when the touch strip is touched."""
+        value = value if isinstance(value, dict) else {}
+        # Swipe (drag) on the strip pages between profiles.
+        if event_type == TouchscreenEventType.DRAG:
+            self._handle_strip_swipe(value)
+            return
+        if event_type != TouchscreenEventType.SHORT:
+            return
+        x = value.get("x", 0)
+        if x < 200:
+            # Tap on the volume tile: toggle speaker mute
+            target = "@DEFAULT_AUDIO_SINK@"
+            indicator = self._update_volume_indicator
+        elif 400 <= x < 600:
+            # Tap on the mic tile (above the third dial): toggle mic mute
+            target = "@DEFAULT_AUDIO_SOURCE@"
+            indicator = self._update_mic_indicator
+        elif 200 <= x < 400:
+            # Tap on the app tile (above the second dial): toggle focused app mute
+            info = self._find_app_stream(*self._focused_window())
+            if info:
+                try:
+                    subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    log(json.dumps({"ev": "touch_mute", "x": x, "app": info["idx"]}))
+                except Exception as exc:
+                    log(json.dumps({"ev": "error", "message": f"touch mute: {exc}"}))
+            self._update_app_indicator()
+            return
+        elif 600 <= x < 800:
+            # Tap on the pinned-app tile (above the fourth dial): toggle its mute
+            info = self._find_pinned_stream()
+            if info:
+                try:
+                    subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    log(json.dumps({"ev": "touch_mute", "x": x, "pinned": info["idx"]}))
+                except Exception as exc:
+                    log(json.dumps({"ev": "error", "message": f"touch mute: {exc}"}))
+            self._update_pinned_indicator()
+            return
+        else:
+            return
+        try:
+            subprocess.run(["wpctl", "set-mute", target, "toggle"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log(json.dumps({"ev": "touch_mute", "x": x}))
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"touch mute: {exc}"}))
+        indicator()
+
+    def _handle_strip_swipe(self, value):
+        """Swipe left/right on the touch strip to page between profiles.
+
+        A drag reports start (x, y) and end (x_out, y_out). Only mostly-
+        horizontal drags that move at least SWIPE_MIN_PX page, so taps and
+        small jiggles are ignored. Swipe left -> next profile, right -> prev.
+        """
+        x0 = value.get("x", 0)
+        y0 = value.get("y", 0)
+        x1 = value.get("x_out", x0)
+        y1 = value.get("y_out", y0)
+        dx = x1 - x0
+        dy = y1 - y0
+        log(json.dumps({"ev": "debug", "msg": f"strip drag x0={x0} y0={y0} x1={x1} y1={y1} dx={dx} dy={dy}"}))
+        if abs(dx) < SWIPE_MIN_PX or abs(dx) <= abs(dy):
+            return
+        direction = 1 if dx < 0 else -1
+        log(json.dumps({"ev": "swipe", "direction": direction, "dx": dx, "dy": dy}))
+
+    def _clear_strip_sections(self):
+        """Blank the unused touch strip section (x=600..800) with a black tile."""
+        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+            return
+        try:
+            img = Image.new("RGB", (200, 100), (0, 0, 0))
+            import io
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            data = buf.getvalue()
+            for x in (600,):
+                self._set_touchscreen_image(data, x, 0, 200, 100)
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"clear strip: {exc}"}))
+
+    def _update_mic_indicator(self):
+        """Render a mic input status tile on the touch strip above the third dial (200x100)."""
+        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+            return
+        try:
+            volume = 0
+            muted = False
+            try:
+                out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+                                     capture_output=True, text=True, timeout=2).stdout
+                volume = int(float(out.split(":")[1]) * 100)
+            except Exception:
+                pass
+            try:
+                out = subprocess.run(["pactl", "get-source-mute", "@DEFAULT_SOURCE@"],
+                                     capture_output=True, text=True, timeout=2).stdout
+                muted = "yes" in out
+            except Exception:
+                pass
+
+            w, h = 200, 100
+            fg = self._hex_to_rgb(self.colors.get("fg", "#ffffff"))
+            accent = self._hex_to_rgb(self.colors.get("accent", "#ff7700"))
+            red = (255, 80, 80)
+
+            img = Image.new("RGB", (w, h), (10, 10, 12))
+            draw = ImageDraw.Draw(img)
+            color = red if muted else accent
+
+            # Microphone icon: official Elgato icon, drawn fallback
+            icon = self._render_official_icon(
+                "microphone-off.svg" if muted else "microphone.svg",
+                "#%02x%02x%02x" % color, 64)
+            if icon is not None:
+                img.paste(icon, (16, 18), icon)
+            else:
+                draw.rounded_rectangle([30, 22, 52, 58], radius=11, fill=color)
+                draw.arc([22, 34, 60, 76], 0, 180, fill=color, width=3)
+                draw.line([(41, 76), (41, 86)], fill=color, width=3)
+                draw.line([(30, 86), (52, 86)], fill=color, width=3)
+                if muted:
+                    draw.line([(64, 34), (82, 66)], fill=red, width=4)
+                    draw.line([(82, 34), (64, 66)], fill=red, width=4)
+
+            # Input level label, right-aligned
+            label = "MUTED" if muted else f"{volume}%"
+            font = self._get_font(34)
+            bbox = draw.textbbox((0, 0), label, font=font)
+            tx = w - (bbox[2] - bbox[0]) - 16
+            ty = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+            draw.text((tx, ty), label, font=font, fill=fg if not muted else red)
+
+            import io
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            self._set_touchscreen_image(buf.getvalue(), 400, 0, 200, 100)
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"mic indicator: {exc}"}))
+
+    def _update_app_indicator(self):
+        """Render the focused-app volume tile on the touch strip above the second dial (200x100)."""
+        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+            return
+        try:
+            cls, title = self._focused_window()
+            info = self._find_app_stream(cls, title)
+            if info is None:
+                volume, muted, app_name = None, False, None
+            else:
+                volume, muted, app_name = info["volume"], info["muted"], info["name"]
+
+            w, h = 200, 100
+            fg = self._hex_to_rgb(self.colors.get("fg", "#ffffff"))
+            accent = self._hex_to_rgb(self.colors.get("accent", "#ff7700"))
+            red = (255, 80, 80)
+            dim = (120, 120, 126)
+
+            img = Image.new("RGB", (w, h), (10, 10, 12))
+            draw = ImageDraw.Draw(img)
+
+            if info is None:
+                font = self._get_font(30)
+                label = "APP"
+                bbox = draw.textbbox((0, 0), label, font=font)
+                tx = (w - (bbox[2] - bbox[0])) // 2 - bbox[0]
+                ty = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+                draw.text((tx, ty), label, font=font, fill=dim)
+            else:
+                color = red if muted else accent
+                icon = self._render_official_icon("sound-effect.svg", "#%02x%02x%02x" % color, 64)
+                if icon is not None:
+                    img.paste(icon, (16, 18), icon)
+                name = (app_name or cls or title or "app")[:16]
+                font_name = self._get_font(20)
+                font_vol = self._get_font(34)
+                vol_label = "MUTE" if muted else (f"{volume}%" if volume is not None else "--")
+                # Percentage: vertically centered, right-aligned (16px) — matches volume/mic tiles
+                bbox = draw.textbbox((0, 0), vol_label, font=font_vol)
+                tx = w - (bbox[2] - bbox[0]) - 16
+                ty = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+                draw.text((tx, ty), vol_label, font=font_vol, fill=color if muted else fg)
+                # App name: centered below the percentage text, clamped inside the tile
+                bbox2 = draw.textbbox((0, 0), name, font=font_name)
+                pct_cx = tx + (bbox[0] + bbox[2]) // 2
+                tx2 = pct_cx - (bbox2[2] - bbox2[0]) // 2 - bbox2[0]
+                if tx2 + bbox2[2] > w - 8:
+                    tx2 = w - 8 - bbox2[2]
+                if tx2 + bbox2[0] < 4:
+                    tx2 = 4 - bbox2[0]
+                ty2 = ty + bbox[3] + 8 - bbox2[1]
+                draw.text((tx2, ty2), name, font=font_name, fill=dim)
+
+            import io
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            self._set_touchscreen_image(buf.getvalue(), 200, 0, 200, 100)
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"app indicator: {exc}"}))
+
+    def _find_pinned_stream(self):
+        """Find the audio stream dial 3 controls (auto-detect).
+
+        Unlike dial 1 this does NOT follow the focused window — it searches all
+        sink inputs, so it works while a game (or anything else) holds focus.
+        Returns the first pinned app (Element, then Discord/Brave) that has a
+        live stream.
+        """
+        for app in PINNED_APPS:
+            for term in app["terms"]:
+                info = self._find_app_stream(term, "")
+                if info:
+                    info["app_label"] = app["label"]
+                    return info
+        return None
+
+    def _debug_streams(self):
+        """Compact list of (idx, name, binary) for all sink inputs — for diagnosis."""
+        try:
+            out = subprocess.run(["pactl", "list", "sink-inputs"],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            return []
+        result = []
+        for block in re.split(r"(?=Sink Input #\d+)", out):
+            m = re.match(r"Sink Input #(\d+)", block)
+            if not m:
+                continue
+            nm = re.search(r'^\s*application\.name\s*=\s*"([^"]*)"', block, re.M)
+            bn = re.search(r'^\s*application\.process\.binary\s*=\s*"([^"]*)"', block, re.M)
+            result.append({"idx": m.group(1),
+                           "name": nm.group(1) if nm else "",
+                           "bin": bn.group(1) if bn else ""})
+        return result
+
+    def _update_pinned_indicator(self):
+        """Render the pinned-app volume tile on the touch strip above the 4th dial (x=600)."""
+        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+            return
+        try:
+            info = self._find_pinned_stream()
+
+            w, h = 200, 100
+            fg = self._hex_to_rgb(self.colors.get("fg", "#ffffff"))
+            accent = self._hex_to_rgb(self.colors.get("accent", "#ff7700"))
+            red = (255, 80, 80)
+            dim = (120, 120, 126)
+
+            img = Image.new("RGB", (w, h), (10, 10, 12))
+            draw = ImageDraw.Draw(img)
+
+            if info is None:
+                volume, muted = None, False
+                color = dim
+                name = "Auto"
+            else:
+                volume, muted = info["volume"], info["muted"]
+                color = red if muted else accent
+                name = (info.get("app_label") or "Auto")[:16]
+            icon = self._render_official_icon("sound-effect.svg", "#%02x%02x%02x" % color, 64)
+            if icon is not None:
+                img.paste(icon, (16, 18), icon)
+
+            font_name = self._get_font(20)
+            font_vol = self._get_font(34)
+            vol_label = "MUTE" if muted else (f"{volume}%" if volume is not None else "--")
+            # Percentage: vertically centered, right-aligned (16px) — matches other tiles
+            bbox = draw.textbbox((0, 0), vol_label, font=font_vol)
+            tx = w - (bbox[2] - bbox[0]) - 16
+            ty = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+            draw.text((tx, ty), vol_label, font=font_vol,
+                      fill=(red if muted else fg) if info else dim)
+            # App name: centered below the percentage text, clamped inside the tile
+            bbox2 = draw.textbbox((0, 0), name, font=font_name)
+            pct_cx = tx + (bbox[0] + bbox[2]) // 2
+            tx2 = pct_cx - (bbox2[2] - bbox2[0]) // 2 - bbox2[0]
+            if tx2 + bbox2[2] > w - 8:
+                tx2 = w - 8 - bbox2[2]
+            if tx2 + bbox2[0] < 4:
+                tx2 = 4 - bbox2[0]
+            ty2 = ty + bbox[3] + 8 - bbox2[1]
+            draw.text((tx2, ty2), name, font=font_name, fill=dim)
+
+            import io
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            self._set_touchscreen_image(buf.getvalue(), 600, 0, 200, 100)
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"pinned indicator: {exc}"}))
+
+    def _update_volume_indicator(self):
+        """Render a volume status tile on the touch strip above the left dial (200x100)."""
+        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+            return
+        try:
+            volume = 0
+            muted = False
+            try:
+                out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                                     capture_output=True, text=True, timeout=2).stdout
+                volume = int(float(out.split(":")[1]) * 100)
+            except Exception:
+                pass
+            try:
+                out = subprocess.run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"],
+                                     capture_output=True, text=True, timeout=2).stdout
+                muted = "yes" in out
+            except Exception:
+                pass
+
+            w, h = 200, 100
+            fg = self._hex_to_rgb(self.colors.get("fg", "#ffffff"))
+            accent = self._hex_to_rgb(self.colors.get("accent", "#ff7700"))
+            red = (255, 80, 80)
+
+            img = Image.new("RGB", (w, h), (10, 10, 12))
+            draw = ImageDraw.Draw(img)
+            color = red if muted else accent
+
+            # Speaker icon: official Elgato icon, drawn fallback
+            icon = self._render_official_icon(
+                "volume-muted.svg" if muted else "volume.svg",
+                "#%02x%02x%02x" % color, 64)
+            if icon is not None:
+                img.paste(icon, (16, 18), icon)
+            else:
+                draw.rectangle([24, 42, 40, 58], fill=color)
+                draw.polygon([(40, 42), (58, 28), (58, 72), (40, 58)], fill=color)
+                if muted:
+                    draw.line([(68, 34), (86, 66)], fill=red, width=4)
+                    draw.line([(86, 34), (68, 66)], fill=red, width=4)
+                else:
+                    for r in (14, 26):
+                        draw.arc([64 - r, 50 - r, 64 + r, 50 + r], -60, 60, fill=color, width=3)
+
+            # Volume label, right-aligned
+            label = "MUTE" if muted else f"{volume}%"
+            font = self._get_font(34)
+            bbox = draw.textbbox((0, 0), label, font=font)
+            tx = w - (bbox[2] - bbox[0]) - 16
+            ty = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+            draw.text((tx, ty), label, font=font, fill=fg if not muted else red)
+
+            import io
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=90)
+            self._set_touchscreen_image(buf.getvalue(), 0, 0, 200, 100)
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"volume indicator: {exc}"}))
+
     def _handle_press(self, index: int):
         """Execute the action mapped to a button index."""
         log(json.dumps({"ev": "debug", "msg": f"_handle_press({index}) called"}))
@@ -266,13 +1192,25 @@ class StreamDeckBridge:
             return
         action_type = btn.get("action_type", "")
         action_value = btn.get("action_value", "")
+        # Special: cycle the default audio output and refresh this key's label.
+        # Runs on a background thread so the reader thread (which handles all
+        # key/dial/touch events) is never blocked by the switch subprocess.
+        if action_type == "audio_output":
+            self._handle_audio_cycle(index)
+            return
         if not action_type or not action_value:
             return
 
         try:
-            if action_type == "command":
-                # Execute shell command detached
+            if action_type in ("command", "magnitude"):
+                # Execute shell command detached (magnitude keys run their
+                # toggle script; the poll loop refreshes the key label).
                 subprocess.Popen(action_value, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if action_type == "magnitude":
+                    # Poll faster for a while so the transitional labels
+                    # (Preparing / Loading % / Finalizing / Stopping) are
+                    # visible; see _magnitude_fast_polling.
+                    self._magnitude_fast_until = time.time() + 15
             elif action_type == "keybinding":
                 # Use wtype or ydotool or hyprctl dispatch
                 # Try multiple methods for robustness
@@ -394,12 +1332,14 @@ class StreamDeckBridge:
             except Exception:
                 continue
             dtype = device.deck_type()
-            # Accept known key-based devices (ignore pedals / touch-only)
-            if dtype in ("Stream Deck XL", "Stream Deck Original", "Stream Deck Original V2"):
+            # Accept known key-based devices (ignore pedals)
+            if dtype in ("Stream Deck XL", "Stream Deck Original", "Stream Deck Original V2", "Stream Deck +"):
                 self.deck = device
                 self.deck_type = dtype
                 self.serial = device.get_serial_number()
                 device.set_key_callback(self._on_key_change)
+                device.set_dial_callback(self._on_dial)
+                device.set_touchscreen_callback(self._on_touchscreen)
                 return True
             try:
                 device.close()
@@ -420,6 +1360,14 @@ class StreamDeckBridge:
                 }))
                 # Update buttons with loaded config
                 self._update_all_buttons()
+                # Show initial volume status on the touch strip
+                self._update_volume_indicator()
+                # Show initial mic input status on the touch strip
+                self._update_mic_indicator()
+                # Show initial focused-app volume status on the touch strip
+                self._update_app_indicator()
+                # Show the pinned-app (dial 3) auto-detect status tile
+                self._update_pinned_indicator()
             else:
                 log(json.dumps({"ev": "error", "message": "No Stream Deck found. Check USB connection and udev rules."}))
         except Exception as exc:
@@ -448,6 +1396,8 @@ class StreamDeckBridge:
     def set_colors(self, colors: dict):
         self.colors = colors
         self._cached_icons.clear()
+        self._cache_keys.clear()
+        self._official_icon_cache.clear()
         self._update_all_buttons()
 
     def set_buttons(self, buttons: list[dict]):
@@ -458,17 +1408,44 @@ class StreamDeckBridge:
             if 0 <= idx < count:
                 self.buttons[idx] = btn
         self._cached_icons.clear()
+        self._cache_keys.clear()
         self._update_all_buttons()
 
+    def _stdin_reader(self, q):
+        """Read stdin lines in a dedicated thread and push them onto a queue.
+
+        Reading in a thread (rather than select() on sys.stdin) avoids the
+        classic gotcha where select() only sees the file descriptor and misses
+        data already buffered by Python's text wrapper — which would deadlock
+        the loop when two commands arrive in a single read chunk.
+        """
+        try:
+            for line in sys.stdin:
+                q.put(line)
+        except Exception:
+            pass
+        q.put(None)  # sentinel: stdin closed / EOF
+
     def run(self):
-        """Main loop: read commands from stdin."""
+        """Main loop: read commands from stdin (via a reader thread + queue)."""
+        import queue as _queue
+        q = _queue.Queue()
+        reader = threading.Thread(target=self._stdin_reader, args=(q,), daemon=True)
+        reader.start()
         # Attempt initial connection
         self.connect()
 
         while self.running:
             try:
-                line = sys.stdin.readline()
-                if not line:
+                # Wait for a command, but time out so we can refresh the
+                # audio output key label when the default sink changes.
+                try:
+                    line = q.get(timeout=0.5 if self._magnitude_fast_polling() else 3.0)
+                except _queue.Empty:
+                    self._maybe_refresh_audio_keys()
+                    self._maybe_refresh_magnitude_keys()
+                    continue
+                if line is None:
                     break
                 line = line.strip()
                 if not line:
@@ -520,7 +1497,21 @@ def main():
     try:
         with open(config_path) as f:
             config = json.load(f)
-            btns = config.get("buttons", [])
+            # v3 schema: array of profiles; use the active profile's buttons.
+            btns = []
+            if isinstance(config.get("profiles"), list):
+                active_id = config.get("activeProfileId", "")
+                prof = None
+                for p in config["profiles"]:
+                    if p.get("id") == active_id:
+                        prof = p
+                        break
+                if prof is None and config["profiles"]:
+                    prof = config["profiles"][0]
+                if prof:
+                    btns = prof.get("buttons", [])
+            else:
+                btns = config.get("buttons", [])  # legacy v1 flat array
             bridge.buttons = {}
             for btn in btns:
                 idx = btn.get("index", -1)
