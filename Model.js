@@ -19,7 +19,10 @@
 //     "original": "work-orig",   // profile id auto-applied when an Original connects
 //     "plus": ""                 // profile id auto-applied when a Stream Deck + connects
 //   },
-//   "brightness": 50             // deck brightness, 0-100
+//   "brightness": 50,            // deck brightness, 0-100
+//   "pinnedApps": [              // optional: apps the Stream Deck + 4th dial looks for, in order
+//     { "label": "Element", "terms": ["element", "element-desktop"] }
+//   ]
 // }
 //
 // Legacy schemas are migrated on load:
@@ -155,7 +158,24 @@ function parseConfig(text) {
   var parsed = null;
   try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
   result.config.brightness = brightnessFrom(parsed);
+  result.config.pinnedApps = pinnedAppsFrom(parsed);
   return result;
+}
+
+// Optional override for the Stream Deck + pinned-app dial:
+// [{ "label": "Element", "terms": ["element", "element-desktop"] }, ...].
+// Returns null (use the bridge's built-in list) unless the config has a
+// usable list.
+function pinnedAppsFrom(parsed) {
+  if (!parsed || !Array.isArray(parsed.pinnedApps)) return null;
+  var apps = [];
+  for (var i = 0; i < parsed.pinnedApps.length; i++) {
+    var a = parsed.pinnedApps[i];
+    if (!a || typeof a.label !== "string" || !Array.isArray(a.terms)) continue;
+    var terms = a.terms.filter(function(t) { return typeof t === "string" && t.trim() !== ""; });
+    if (terms.length > 0) apps.push({ label: a.label, terms: terms });
+  }
+  return apps.length > 0 ? apps : null;
 }
 
 // The profile part of parseConfig (all schema versions).

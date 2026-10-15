@@ -1155,7 +1155,7 @@ Panel {
             visible: root.editTypeDraft !== "audio_output"
 
             Text {
-              text: root.editTypeDraft === "command" ? "Shell command" : "Key combo"
+              text: root.editTypeDraft === "keybinding" ? "Key combo" : "Shell command"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -1168,7 +1168,7 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              text: root.editTypeDraft === "command"
+              text: root.editTypeDraft !== "keybinding"
                 ? "Run as-is in a shell."
                 : "Format: SUPER+ALT+Enter. Available keys: Enter, Space, a-z, 0-9, F1-F12, etc."
             }
@@ -1179,7 +1179,7 @@ Panel {
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
-              placeholderText: root.editTypeDraft === "command" ? "alacritty" : "SUPER+ALT+Enter"
+              placeholderText: root.editTypeDraft === "keybinding" ? "SUPER+ALT+Enter" : "alacritty"
               onTextChanged: root.editActionDraft = text
             }
           }

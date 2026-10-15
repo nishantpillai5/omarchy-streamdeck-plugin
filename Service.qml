@@ -34,6 +34,7 @@ QtObject {
   property string phase: "idle"
   property string lastError: ""
   property int brightness: 50
+  property var pinnedApps: null       // optional Stream Deck + pinned-app list (null = bridge default)
   property string deckType: ""
   property int deviceButtonCount: 32
 
@@ -95,6 +96,10 @@ QtObject {
       brightness = parsed.config.brightness
       if (isReady) pushBrightness()
     }
+    if (JSON.stringify(parsed.config.pinnedApps) !== JSON.stringify(pinnedApps)) {
+      pinnedApps = parsed.config.pinnedApps
+      if (bridgeController.running) bridgeController.send({ op: "config", pinned_apps: pinnedApps })
+    }
     if (parsed.error) {
       lastError = parsed.error
       if (phase !== "ready") phase = "error"
@@ -113,14 +118,16 @@ QtObject {
   }
 
   function saveConfig() {
-    var text = Model.serializeConfig({
+    var config = {
       version: Model.SCHEMA_VERSION,
       activeProfileId: activeProfileId,
       profiles: profiles,
       defaults: defaults,
       brightness: brightness
-    })
-    configFile.setText(text)
+    }
+    // Only written when the user set one, so the default list can change.
+    if (pinnedApps) config.pinnedApps = pinnedApps
+    configFile.setText(Model.serializeConfig(config))
   }
 
   // JSON of the last button set sent to the bridge. Saving the config makes
@@ -151,7 +158,8 @@ QtObject {
         fg: Color.foreground.toString(),
         bg: Color.background.toString(),
         accent: Color.accent.toString()
-      }
+      },
+      pinned_apps: pinnedApps
     })
   }
 

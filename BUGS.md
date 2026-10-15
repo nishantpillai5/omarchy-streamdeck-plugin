@@ -203,27 +203,32 @@ tiles that go nowhere.
 
 **Fix:** check `self.deck.TOUCHSCREEN_PIXEL_WIDTH > 0`.
 
-### Things to tidy on the fork
+### Things to tidy on the fork — done
 - **Undocumented `magnitude` action type**: it hard-codes
   `/usr/lib/magnitude-desktop/...` and `~/.magnitude/state/models.json`, polls every
   0.5 s, and isn't in the commit message, `AGENT_NOTES.md` or the panel's edit form.
   It's specific to this machine; keep it out of anything sent upstream.
+  *(Documented in `AGENT_NOTES.md`; the edit form now treats it as a shell command.)*
 - **`PINNED_APPS`** (Element, and Brave treated as Discord) is specific to this setup.
-  Make it configurable before sending upstream.
+  Make it configurable before sending upstream. *(Now overridable with `pinnedApps`
+  in `buttons.json`; the built-in list is the default.)*
 - **Dead code**: `_update_audio_key`, `_update_element_key`, `AUDIO_KEY`,
-  `_clear_strip_sections`.
+  `_clear_strip_sections`. *(Removed.)*
 - **Copy-pasted drawing code**: `_generate_audio_icon` / `_generate_magnitude_icon`
-  are near-copies, and so are the four `_update_*_indicator` tile functions. Shared
-  helpers would remove about 200 lines.
+  are near-copies, and so are the four `_update_*_indicator` tile functions.
+  *(Now share `_generate_glyph_label_icon` and the tile helpers. All 44 icon/tile
+  variants render byte-identical to before.)*
 - **Outdated header**: the bridge docstring still describes the XL-only protocol, with
-  no dials, touch, `swipe`, `audio_output` or `magnitude`.
+  no dials, touch, `swipe`, `audio_output` or `magnitude`. *(Rewritten.)*
 - **`_magnitude_state` fallback**: the `pgrep` call in its fallback can raise outside a
-  `try`, which logs a "Command error" on every poll.
-- **`AGENT_NOTES.md` mistakes**:
+  `try`, which logs a "Command error" on every poll. *(Wrapped.)*
+- **`AGENT_NOTES.md` mistakes**: *(Fixed, and updated for all the changes above.)*
   - it says the log goes to the file "not stdout", but `log()` writes to both
   - it lists profiles as a local patch, but they're upstream (`78cb619`)
   - it says the bridge is ~1,300 lines; it's about 1,530 now
   - it names this machine's audio devices and mic source in a public repo
+    *(Left as is: it's useful context for agents on this machine. Remove it if you'd
+    rather not publish it.)*
 
 ### What the fork already fixes from upstream
 - per-button icon cache (`_cache_keys`)
