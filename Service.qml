@@ -33,6 +33,7 @@ QtObject {
   property string activeProfileId: ""  // profile currently shown/edited/pushed
   property var defaults: ({})          // { xl: profileId, original: profileId, plus: profileId }
   property bool followDevice: true     // auto-apply the per-device default on connect
+  property bool configLoaded: false    // true once buttons.json has been read (or found missing)
 
   readonly property bool isReady: phase === "ready"
   readonly property bool hasError: phase === "error"
@@ -81,6 +82,13 @@ QtObject {
     if (parsed.error) {
       lastError = parsed.error
       if (phase !== "ready") phase = "error"
+    }
+    // If the device connected before the config finished loading, the
+    // "ready" handler skipped picking its profile; do it now.
+    var firstLoad = !configLoaded
+    configLoaded = true
+    if (firstLoad && isReady && followDevice) {
+      activeProfileId = ensureDeviceProfile(Model.layoutKeyForDeckType(deckType))
     }
     console.log("[StreamDeck Service] profiles:", profiles.length, "active:", activeProfileId)
     if (isReady && bridgeController.running) {
@@ -204,13 +212,36 @@ QtObject {
   function resumeFollowDevice() {
     followDevice = true
     if (phase === "ready") {
-      var key = Model.layoutKeyForDeckType(deckType)
-      var def = defaults[key]
-      if (def && profileById(def)) {
-        activeProfileId = def
-        if (bridgeController.running) pushButtons()
-      }
+      activeProfileId = ensureDeviceProfile(Model.layoutKeyForDeckType(deckType))
+      if (bridgeController.running) pushButtons()
     }
+  }
+
+  // Return the default profile id for a layout, making sure one exists.
+  // Configs created before a layout existed (e.g. "plus") have no profile or
+  // default for it: use the first profile with that layout, or create one,
+  // and record it as the default. Only saves when something changed.
+  function ensureDeviceProfile(layoutKey) {
+    var layout = Model.layoutByKey(layoutKey)
+    if (!layout) return activeProfileId
+    var def = defaults[layoutKey]
+    if (def && profileById(def)) return def
+
+    var match = null
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].layout === layoutKey) { match = profiles[i]; break }
+    }
+    if (!match) {
+      match = Model.newProfile(layout.label, layoutKey)
+      // Assign a new array so bindings on `profiles` re-evaluate.
+      profiles = profiles.concat([match])
+    }
+    var newDefaults = {}
+    for (var k in defaults) newDefaults[k] = defaults[k]
+    newDefaults[layoutKey] = match.id
+    defaults = newDefaults
+    saveConfig()
+    return match.id
   }
 
   // Replace the buttons for a profile, then persist.
@@ -239,12 +270,8 @@ QtObject {
       root.lastError = ""
       root.deckType = event.deck_type || ""
       if (event.button_count) root.deviceButtonCount = event.button_count
-      if (followDevice) {
-        var key = Model.layoutKeyForDeckType(root.deckType)
-        var def = root.defaults[key]
-        if (def && root.profileById(def)) {
-          root.activeProfileId = def
-        }
+      if (followDevice && configLoaded) {
+        root.activeProfileId = root.ensureDeviceProfile(Model.layoutKeyForDeckType(root.deckType))
       }
       console.log("[StreamDeck Service] device ready, active profile:", root.activeProfileId)
       delayPushTimer.start()
@@ -257,15 +284,25 @@ QtObject {
       root.lastError = event.message || "Unknown error"
       break
     case "swipe": {
-      // Page between profiles: swipe left -> next, right -> previous (wraps).
+      // Page between the connected device's profiles: swipe left -> next,
+      // right -> previous (wraps). Profiles for other layouts are skipped.
       var dir = (event.direction === undefined) ? 0 : event.direction
-      if (dir === 0 || root.profiles.length < 2) break
-      var idx = root.profileIndexById(root.activeProfileId)
-      if (idx < 0) idx = 0
-      var next = idx + dir
-      if (next < 0) next = root.profiles.length - 1
-      if (next >= root.profiles.length) next = 0
-      if (next !== idx) root.applyProfile(root.profiles[next].id)
+      if (dir === 0) break
+      var layoutKey = Model.layoutKeyForDeckType(root.deckType)
+      var pages = root.profiles.filter(function(p) { return p.layout === layoutKey })
+      if (pages.length === 0) break
+      var idx = -1
+      for (var i = 0; i < pages.length; i++) {
+        if (pages[i].id === root.activeProfileId) { idx = i; break }
+      }
+      var next
+      if (idx < 0) {
+        // Active profile is for another layout: jump into this device's pages.
+        next = dir > 0 ? 0 : pages.length - 1
+      } else {
+        next = (idx + dir + pages.length) % pages.length
+      }
+      if (next !== idx) root.applyProfile(pages[next].id)
       break
     }
     case "button_down":

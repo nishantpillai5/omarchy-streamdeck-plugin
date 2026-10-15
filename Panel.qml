@@ -519,7 +519,7 @@ Panel {
                 }
 
                 Button {
-                  text: "+"
+                  text: "Plus"
                   selected: root.newProfileLayout === "plus"
                   foreground: root.foreground
                   accent: root.accent
@@ -528,7 +528,7 @@ Panel {
                 }
 
                 Button {
-                  text: "+"
+                  text: "Add"
                   foreground: root.foreground
                   accent: root.accent
                   fontFamily: root.fontFamily
@@ -639,7 +639,7 @@ Panel {
                   }
 
                   Button {
-                    text: "+"
+                    text: "Plus"
                     selected: root.selectedIsDefaultPlus
                     foreground: root.foreground
                     accent: root.accent

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -104,6 +105,29 @@ class StreamDeckBridge:
         self._font: ImageFont.FreeTypeFont | None = None
         self._cached_icons: dict[int, bytes] = {}
         self._cache_keys: dict[int, str] = {}
+        # Dial/touch work runs on its own thread so the device reader thread
+        # (which also delivers key presses) never waits on wpctl/pactl.
+        # Turn notches that arrive while a turn is pending are merged into it.
+        self._audio_tasks: queue.Queue = queue.Queue()
+        self._turn_lock = threading.Lock()
+        self._pending_turns: dict[int, int] = {}
+        threading.Thread(target=self._audio_worker, daemon=True).start()
+
+    def _has_touchscreen(self) -> bool:
+        """True if the connected deck has a touch strip (only the Plus).
+
+        Every device class defines set_touchscreen_image (as a no-op on decks
+        without a strip), so check the strip's size instead."""
+        return bool(self.deck) and getattr(self.deck, "TOUCHSCREEN_PIXEL_WIDTH", 0) > 0
+
+    def _audio_worker(self):
+        """Run queued dial/touch actions one at a time, in arrival order."""
+        while True:
+            task = self._audio_tasks.get()
+            try:
+                task()
+            except Exception as exc:
+                log(json.dumps({"ev": "error", "message": f"audio task: {exc}"}))
 
     def _icon_size(self) -> tuple[int, int]:
         """Return (width, height) of a key image for the current device."""
@@ -157,33 +181,42 @@ class StreamDeckBridge:
         return self._font
 
     def _render_official_icon(self, name: str, color_hex: str, size: int):
-        """Render an official Elgato SVG icon tinted with the given color.
+        """Render an SVG icon tinted with the given color.
+
+        `name` is either a file name in ~/.config/omarchy/streamdeck/icons/
+        (the official Elgato set) or an absolute path to any SVG.
 
         Returns a PIL RGBA image, or None if unavailable (callers fall back
-        to drawn icons).
+        to drawn icons). Failures are cached too, so a missing rsvg-convert
+        is not retried on every render.
         """
         import tempfile
-        cache_key = (name, color_hex, size)
+        if os.path.isabs(name):
+            svg_path = name
+        else:
+            svg_path = os.path.expanduser(f"~/.config/omarchy/streamdeck/icons/{name}")
+        cache_key = (svg_path, color_hex, size)
         if cache_key in self._official_icon_cache:
             return self._official_icon_cache[cache_key]
-        svg_path = os.path.expanduser(f"~/.config/omarchy/streamdeck/icons/{name}")
         if not os.path.isfile(svg_path):
             return None
-        try:
-            svg = open(svg_path).read().replace("currentColor", color_hex)
-            with tempfile.NamedTemporaryFile("w", suffix=".svg", delete=False) as f:
-                f.write(svg)
-                svg_tmp = f.name
-            png_tmp = svg_tmp[:-4] + ".png"
-            subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(size), svg_tmp, "-o", png_tmp],
-                           check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            img = Image.open(png_tmp).convert("RGBA")
-            os.unlink(svg_tmp)
-            os.unlink(png_tmp)
-            self._official_icon_cache[cache_key] = img
-            return img
-        except Exception:
-            return None
+        img = None
+        with tempfile.TemporaryDirectory(prefix="streamdeck-icon-") as tmp:
+            svg_tmp = os.path.join(tmp, "icon.svg")
+            png_tmp = os.path.join(tmp, "icon.png")
+            try:
+                with open(svg_path) as f:
+                    svg = f.read().replace("currentColor", color_hex)
+                with open(svg_tmp, "w") as f:
+                    f.write(svg)
+                subprocess.run(["rsvg-convert", "-w", str(size), "-h", str(size), svg_tmp, "-o", png_tmp],
+                               check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with Image.open(png_tmp) as rendered:
+                    img = rendered.convert("RGBA")
+            except Exception as exc:
+                log(json.dumps({"ev": "error", "message": f"render icon {svg_path}: {exc}"}))
+        self._official_icon_cache[cache_key] = img
+        return img
 
     def _hex_to_rgb(self, hex_color: str) -> tuple[int, int, int]:
         hex_color = hex_color.lstrip("#")
@@ -372,10 +405,9 @@ class StreamDeckBridge:
 
         if icon_path and os.path.isfile(icon_path):
             if icon_path.lower().endswith(".svg"):
-                # Official Elgato SVG: render the glyph at a uniform size, tinted
-                # with the foreground color, centered on a black background.
-                name = os.path.basename(icon_path)
-                glyph = self._render_official_icon(name, self.colors.get("fg", "#ffffff"), ICON_GLYPH_SIZE)
+                # SVG: render the glyph at a uniform size, tinted with the
+                # foreground color, centered on a black background.
+                glyph = self._render_official_icon(os.path.abspath(icon_path), self.colors.get("fg", "#ffffff"), ICON_GLYPH_SIZE)
                 if glyph is not None:
                     canvas = Image.new("RGB", (w, h), (0, 0, 0))
                     glyph = glyph.convert("RGBA")
@@ -426,7 +458,7 @@ class StreamDeckBridge:
 
     def _set_touchscreen_image(self, data: bytes, x: int, y: int, w: int, h: int):
         """Thread-safe touch-strip image write (see _set_key_image)."""
-        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+        if not self._has_touchscreen():
             return
         with self._lock:
             self.deck.set_touchscreen_image(data, x, y, w, h)
@@ -690,21 +722,32 @@ class StreamDeckBridge:
         except Exception:
             return "", ""
 
-    def _find_app_stream(self, app_class, title):
+    def _list_sink_inputs(self):
+        """Raw `pactl list sink-inputs` output, or None if pactl failed."""
+        try:
+            return subprocess.run(["pactl", "list", "sink-inputs"],
+                                  capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            return None
+
+    def _find_app_stream(self, app_class, title, listing=None):
         """Locate the audio stream (sink input) for the focused window's app.
 
         Returns a dict {idx, volume, muted, name} or None if no match.
         Parses `pactl list sink-inputs` blocks, matching the window
         class/title against each stream's application properties
-        (PipeWire sets these instead of a plain Name: field).
+        (PipeWire sets these instead of a plain Name: field). Pass `listing`
+        to reuse output already fetched by _list_sink_inputs().
         """
-        try:
-            out = subprocess.run(["pactl", "list", "sink-inputs"],
-                                 capture_output=True, text=True, timeout=3).stdout
-        except Exception:
-            return None
         cl = (app_class or "").lower().strip()
         ti = (title or "").lower().strip()
+        # Nothing to match against (e.g. an empty workspace has no focused
+        # window). Without this, `cl in c` is true for every stream.
+        if not cl and not ti:
+            return None
+        out = listing if listing is not None else self._list_sink_inputs()
+        if out is None:
+            return None
         best, best_score, best_block = None, 0, None
         for block in re.split(r"(?=Sink Input #\d+)", out):
             m = re.match(r"Sink Input #(\d+)", block)
@@ -742,93 +785,122 @@ class StreamDeckBridge:
         return {"idx": best, "volume": volume, "muted": muted, "name": name}
 
     def _on_dial(self, deck, dial, event_type, value):
-        """Callback when a Stream Deck dial is turned or pushed."""
+        """Callback when a Stream Deck dial is turned or pushed.
+
+        Runs on the device reader thread, so it only queues work for
+        _audio_worker. Turn notches for a dial accumulate until the worker
+        picks them up, so a fast spin becomes one volume change instead of
+        a backlog of them.
+        """
+        if dial not in (0, 1, 2, 3):
+            return
         if event_type == DialEventType.TURN:
-            # dial 0: system, 1: focused app, 2: mic, 3: pinned app
-            if dial not in (0, 1, 2, 3):
+            amount = int(value)
+            if amount == 0:
                 return
-            step = max(-20, min(20, int(value) * 2))
-            if step == 0:
-                return
-            sign = "+" if step > 0 else "-"
-            indicator = None
-            try:
-                if dial == 0:
-                    subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", f"{abs(step)}%{sign}"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_volume_indicator
-                elif dial == 2:
-                    subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SOURCE@", f"{abs(step)}%{sign}"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_mic_indicator
-                elif dial == 1:
-                    info = self._find_app_stream(*self._focused_window())
-                    if not info:
-                        log(json.dumps({"ev": "dial_turn", "dial": dial, "note": "no app stream"}))
-                        self._update_app_indicator()
-                        return
-                    cur = info["volume"] if info["volume"] is not None else 50
-                    new = max(0, min(100, cur + step))
-                    subprocess.run(["pactl", "set-sink-input-volume", info["idx"], f"{new}%"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_app_indicator
-                elif dial == 3:
-                    info = self._find_pinned_stream()
-                    if not info:
-                        log(json.dumps({"ev": "dial_turn", "dial": dial, "note": "no pinned stream",
-                                        "streams": self._debug_streams()}))
-                        self._update_pinned_indicator()
-                        return
-                    cur = info["volume"] if info["volume"] is not None else 50
-                    new = max(0, min(100, cur + step))
-                    subprocess.run(["pactl", "set-sink-input-volume", info["idx"], f"{new}%"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_pinned_indicator
-                log(json.dumps({"ev": "dial_turn", "dial": dial, "amount": value, "volume_change": step}))
-            except Exception as exc:
-                log(json.dumps({"ev": "error", "message": f"dial turn: {exc}"}))
-                return
-            if indicator:
-                indicator()
+            with self._turn_lock:
+                queued = dial in self._pending_turns
+                self._pending_turns[dial] = self._pending_turns.get(dial, 0) + amount
+            if not queued:
+                self._audio_tasks.put(lambda: self._apply_dial_turn(dial))
         elif event_type == DialEventType.PUSH:
-            # dial 0: speaker mute, 1: focused app mute, 2: mic mute, 3: pinned app mute
-            if not value or dial not in (0, 1, 2, 3):
-                return
-            indicator = None
-            try:
-                if dial == 0:
-                    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_volume_indicator
-                elif dial == 2:
-                    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_mic_indicator
-                elif dial == 1:
-                    info = self._find_app_stream(*self._focused_window())
-                    if not info:
-                        self._update_app_indicator()
-                        return
-                    subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_app_indicator
-                elif dial == 3:
-                    info = self._find_pinned_stream()
-                    if not info:
-                        self._update_pinned_indicator()
-                        return
-                    subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    indicator = self._update_pinned_indicator
-                log(json.dumps({"ev": "dial_push", "dial": dial}))
-            except Exception as exc:
-                log(json.dumps({"ev": "error", "message": f"dial push: {exc}"}))
-                return
-            if indicator:
-                indicator()
+            if value:
+                self._audio_tasks.put(lambda: self._dial_push(dial))
+
+    def _apply_dial_turn(self, dial):
+        """Apply all turn notches accumulated for `dial` (worker thread)."""
+        with self._turn_lock:
+            value = self._pending_turns.pop(dial, 0)
+        self._dial_turn(dial, value)
+
+    def _dial_turn(self, dial, value):
+        """Change the volume a dial controls by `value` notches (worker thread)."""
+        # dial 0: system, 1: focused app, 2: mic, 3: pinned app
+        step = max(-50, min(50, int(value) * 2))
+        if step == 0:
+            return
+        sign = "+" if step > 0 else "-"
+        indicator = None
+        try:
+            if dial == 0:
+                subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", f"{abs(step)}%{sign}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_volume_indicator
+            elif dial == 2:
+                subprocess.run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SOURCE@", f"{abs(step)}%{sign}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_mic_indicator
+            elif dial == 1:
+                info = self._find_app_stream(*self._focused_window())
+                if not info:
+                    log(json.dumps({"ev": "dial_turn", "dial": dial, "note": "no app stream"}))
+                    self._update_app_indicator()
+                    return
+                cur = info["volume"] if info["volume"] is not None else 50
+                new = max(0, min(100, cur + step))
+                subprocess.run(["pactl", "set-sink-input-volume", info["idx"], f"{new}%"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_app_indicator
+            elif dial == 3:
+                info = self._find_pinned_stream()
+                if not info:
+                    log(json.dumps({"ev": "dial_turn", "dial": dial, "note": "no pinned stream",
+                                    "streams": self._debug_streams()}))
+                    self._update_pinned_indicator()
+                    return
+                cur = info["volume"] if info["volume"] is not None else 50
+                new = max(0, min(100, cur + step))
+                subprocess.run(["pactl", "set-sink-input-volume", info["idx"], f"{new}%"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_pinned_indicator
+            log(json.dumps({"ev": "dial_turn", "dial": dial, "amount": value, "volume_change": step}))
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"dial turn: {exc}"}))
+            return
+        if indicator:
+            indicator()
+
+    def _dial_push(self, dial):
+        """Toggle the mute a dial controls (worker thread)."""
+        # dial 0: speaker mute, 1: focused app mute, 2: mic mute, 3: pinned app mute
+        indicator = None
+        try:
+            if dial == 0:
+                subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_volume_indicator
+            elif dial == 2:
+                subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_mic_indicator
+            elif dial == 1:
+                info = self._find_app_stream(*self._focused_window())
+                if not info:
+                    self._update_app_indicator()
+                    return
+                subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_app_indicator
+            elif dial == 3:
+                info = self._find_pinned_stream()
+                if not info:
+                    self._update_pinned_indicator()
+                    return
+                subprocess.run(["pactl", "set-sink-input-mute", info["idx"], "toggle"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                indicator = self._update_pinned_indicator
+            log(json.dumps({"ev": "dial_push", "dial": dial}))
+        except Exception as exc:
+            log(json.dumps({"ev": "error", "message": f"dial push: {exc}"}))
+            return
+        if indicator:
+            indicator()
 
     def _on_touchscreen(self, deck, event_type, value):
-        """Callback when the touch strip is touched."""
+        """Callback when the touch strip is touched.
+
+        Runs on the device reader thread: swipes are reported to the shell
+        straight away, taps are queued for _audio_worker."""
         value = value if isinstance(value, dict) else {}
         # Swipe (drag) on the strip pages between profiles.
         if event_type == TouchscreenEventType.DRAG:
@@ -837,6 +909,10 @@ class StreamDeckBridge:
         if event_type != TouchscreenEventType.SHORT:
             return
         x = value.get("x", 0)
+        self._audio_tasks.put(lambda: self._touch_tap(x))
+
+    def _touch_tap(self, x):
+        """Toggle the mute of the tile tapped at `x` (worker thread)."""
         if x < 200:
             # Tap on the volume tile: toggle speaker mute
             target = "@DEFAULT_AUDIO_SINK@"
@@ -900,7 +976,7 @@ class StreamDeckBridge:
 
     def _clear_strip_sections(self):
         """Blank the unused touch strip section (x=600..800) with a black tile."""
-        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+        if not self._has_touchscreen():
             return
         try:
             img = Image.new("RGB", (200, 100), (0, 0, 0))
@@ -915,7 +991,7 @@ class StreamDeckBridge:
 
     def _update_mic_indicator(self):
         """Render a mic input status tile on the touch strip above the third dial (200x100)."""
-        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+        if not self._has_touchscreen():
             return
         try:
             volume = 0
@@ -974,7 +1050,7 @@ class StreamDeckBridge:
 
     def _update_app_indicator(self):
         """Render the focused-app volume tile on the touch strip above the second dial (200x100)."""
-        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+        if not self._has_touchscreen():
             return
         try:
             cls, title = self._focused_window()
@@ -1040,9 +1116,12 @@ class StreamDeckBridge:
         Returns the first pinned app (Element, then Discord/Brave) that has a
         live stream.
         """
+        listing = self._list_sink_inputs()
+        if listing is None:
+            return None
         for app in PINNED_APPS:
             for term in app["terms"]:
-                info = self._find_app_stream(term, "")
+                info = self._find_app_stream(term, "", listing)
                 if info:
                     info["app_label"] = app["label"]
                     return info
@@ -1069,7 +1148,7 @@ class StreamDeckBridge:
 
     def _update_pinned_indicator(self):
         """Render the pinned-app volume tile on the touch strip above the 4th dial (x=600)."""
-        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+        if not self._has_touchscreen():
             return
         try:
             info = self._find_pinned_stream()
@@ -1124,7 +1203,7 @@ class StreamDeckBridge:
 
     def _update_volume_indicator(self):
         """Render a volume status tile on the touch strip above the left dial (200x100)."""
-        if not self.deck or not hasattr(self.deck, "set_touchscreen_image"):
+        if not self._has_touchscreen():
             return
         try:
             volume = 0

@@ -26,6 +26,7 @@ The plugin is self-contained: it vendors the `streamdeck` Python package under
 - `python3` (system)
 - `python-pillow` (system package)
 - `hidapi` (system package, via `libhidapi-libusb.so`)
+- `librsvg` (system package, provides `rsvg-convert`; needed for SVG icons)
 
 ## Quick Start
 
