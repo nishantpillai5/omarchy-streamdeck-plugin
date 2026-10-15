@@ -1,16 +1,17 @@
 # Omarchy Stream Deck Plugin
 
-Omarchy shell plugin for Elgato Stream Deck devices (XL, Original, Original V2).
+Omarchy shell plugin for Elgato Stream Deck devices (XL, Original / Original V2 / MK.2, Stream Deck +).
 
 ## Features
 
 - **Bar Widget**: Shows connection status in the Omarchy bar
-- **Auto-connect**: Connects automatically on startup and retries every 10s
-- **Multi-device**: Supports Stream Deck XL (8×4), Original, and Original V2 (5×3)
+- **Auto-connect**: Connects automatically on startup, notices when the deck is unplugged, and retries every 10s
+- **Multi-device**: Supports Stream Deck XL (8×4), Original / V2 / MK.2 (5×3) and Stream Deck + (4×2, dials, touch strip)
+- **Profiles**: Several button layouts per device; each device type can have a default profile
 - **Configuration Panel**: Visual button grid for mapping buttons to actions
 - **Action Types**: Shell commands and keyboard shortcuts (e.g. `SUPER+ALT+Return`)
-- **Custom Icons**: Upload a PNG per button via the edit form
-- **Brightness Control**: Adjust Stream Deck brightness from the panel
+- **Custom Icons**: Upload a PNG, JPEG or SVG per button via the edit form
+- **Brightness Control**: Adjust Stream Deck brightness from the panel (remembered across restarts)
 - **Theme Integration**: Auto-generated icons respect current Omarchy theme colors
 - **IPC Commands**: Scriptable via `omarchy-shell elgato.streamdeck ...`
 
@@ -42,22 +43,35 @@ Config stored in `~/.config/omarchy/streamdeck/buttons.json`:
 
 ```json
 {
-  "version": 1,
-  "buttons": [
+  "version": 3,
+  "activeProfileId": "xl",
+  "profiles": [
     {
-      "index": 0,
-      "label": "Terminal",
-      "icon_path": "",
-      "action_type": "command",
-      "action_value": "alacritty"
+      "id": "xl",
+      "name": "Stream Deck XL",
+      "layout": "xl",
+      "buttons": [
+        {
+          "index": 0,
+          "label": "Terminal",
+          "icon_path": "",
+          "action_type": "command",
+          "action_value": "alacritty"
+        }
+      ]
     }
-  ]
+  ],
+  "defaults": { "xl": "xl", "original": "", "plus": "" },
+  "brightness": 50
 }
 ```
 
-Buttons with an `index` beyond the connected device's key count are stored
-but not displayed until a larger device is connected. `icon_path` may point to
-a custom PNG (see "Upload PNG" in the panel).
+`layout` is `xl` (32 keys), `original` (15 keys) or `plus` (8 keys). `defaults`
+names the profile applied automatically when that kind of device connects.
+`action_type` is `command`, `keybinding` (e.g. `SUPER+ALT+Return`) or
+`audio_output`. `icon_path` may point to a custom PNG, JPEG or SVG (see
+"Upload icon" in the panel). Older `version: 1` and `version: 2` files are
+migrated automatically.
 
 ## IPC Commands
 
@@ -65,8 +79,14 @@ a custom PNG (see "Upload PNG" in the panel).
 # Open/close panel
 omarchy-shell elgato.streamdeck toggle
 
-# Set a button
+# Set a button on the active profile: index label action_type action_value icon_path
 omarchy-shell elgato.streamdeck setButton 0 "Firefox" command firefox ""
+
+# Clear a button
+omarchy-shell elgato.streamdeck clearButton 0
+
+# Set brightness (0-100)
+omarchy-shell elgato.streamdeck setBrightness 70
 
 # Check status
 omarchy-shell elgato.streamdeck status
@@ -78,7 +98,7 @@ omarchy-shell elgato.streamdeck reconnect
 ## Keyboard Shortcuts in Panel
 
 - `← → ↑ ↓` — Navigate grid
-- `Enter` — Edit selected button
+- `Enter` / `e` — Edit selected button
 - `r` — Reconnect device
 - `Esc` — Close panel
 - `Tab` — Next panel

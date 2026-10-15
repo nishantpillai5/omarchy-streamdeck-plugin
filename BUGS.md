@@ -14,7 +14,7 @@ Every upstream bug is also present on the fork unless marked otherwise.
 
 ## Upstream bugs
 
-### U1. Unplugging the deck is never detected, and replugging doesn't reconnect
+### U1. Unplugging the deck is never detected, and replugging doesn't reconnect — fixed on fork
 - `scripts/StreamDeck/Devices/StreamDeck.py:207-209` (vendored): on `TransportError`
   the reader thread stops and closes the device without telling anyone.
 - `scripts/streamdeck-bridge:438`: `disconnected` is only sent from `disconnect()`,
@@ -27,43 +27,49 @@ stays dead until you reconnect by hand. On the fork, the dials and touch strip d
 **Fix:** check `deck.connected()` regularly (the fork's main-loop timeout is a natural
 place) and send `disconnected` when it drops.
 
-### U2. Keybinding parsing breaks named keys
-`scripts/streamdeck-bridge:287, 326`. The combo is upper-cased, the key is lower-cased,
-then `key.capitalize()` is applied. Key names (keysyms) are case-sensitive:
-- `slash`, `minus`, `comma`, `grave`, … become `Slash`, `Minus`, … (invalid)
-- `XF86AudioRaiseVolume` becomes `Xf86audioraisevolume` (invalid)
-- letters become capitals (`t` → `T`)
-- `CONTROL` is silently dropped (only `ctrl` is recognised)
+### U2. Every Ctrl combo fails through `wtype` — fixed on fork
+`scripts/streamdeck-bridge:303, 340`. For `ctrl` the bridge passes `-M control` / `-m control`
+to `wtype`, but `wtype` only knows `shift`, `ctrl`, `alt`, `logo`, `win`, `capslock` and
+`altgr`. It exits with "Invalid modifier name", so no Ctrl shortcut works. A `CONTROL`
+modifier written in a combo is also silently dropped.
 
-**Fix:** keep the user's original casing, only map known aliases (`enter`, `esc`, …),
-lower-case single letters, and accept `control`.
+*Correction:* the first version of this file said `key.capitalize()` breaks names like
+`slash` and `XF86AudioRaiseVolume`. It doesn't: `wtype` looks key names up
+case-insensitively (`XKB_KEYSYM_CASE_INSENSITIVE`). Only the `ydotool` fallback cared
+about the key's name.
 
-### U3. The `hyprctl` and `ydotool` keybinding fallbacks are broken
+**Fix:** map `ctrl`/`control` to `wtype`'s `ctrl`, report unknown modifiers instead of
+dropping them, and pass the key through as typed.
+
+### U3. The `hyprctl` and `ydotool` keybinding fallbacks are broken — fixed on fork
 - `:363`: runs `hyprctl dispatch exec "ydotool key SUPER_ALT_RETURN"`, which isn't valid
-  `ydotool` input. Use `hyprctl dispatch sendshortcut` instead.
+  `ydotool` input. Hyprland's `sendshortcut` isn't a replacement: it sends keys straight
+  to a window and skips Hyprland's own binds, which is what most deck keys trigger.
+  The branch has been removed.
 - `:382`: the direct `ydotool` route sends `125:1 56:1 a`. It presses modifiers but never
-  releases them (`:0`), and `a` isn't a keycode, so modifiers could stay stuck.
+  releases them (`:0`), and `a` isn't a keycode, so modifiers could stay stuck. It now
+  maps keys to Linux key codes and releases everything it presses.
 
-### U4. Custom icons from different profiles overwrite each other
+### U4. Custom icons from different profiles overwrite each other — fixed on fork
 `Panel.qml:172, 188`. Uploads are saved as `icons/btn_<index>.png`, with no profile in the
 name, so button 0 in profile B overwrites button 0's icon in profile A. QML's image cache
 can also keep showing the old picture.
 
 **Fix:** include the profile id (or a content hash) in the file name.
 
-### U5. A file name can break, or inject into, the icon copy command
+### U5. A file name can break, or inject into, the icon copy command — fixed on fork
 `Panel.qml:173`. The chosen path is put inside single quotes in a `bash -c` string, so a
 name containing `'` breaks the command or runs arbitrary code.
 
 **Fix:** pass the paths as arguments:
 `["sh", "-c", 'mkdir -p "$1" && cp "$2" "$3"', "sh", dir, src, dst]`.
 
-### U6. Uploading an icon saves the form and closes it
+### U6. Uploading an icon saves the form and closes it — fixed on fork
 `Panel.qml:190`. `copyIconProc.onExited` calls `saveEdit()`, which saves half-typed
 label/action text and closes the editor. It reads `editingIndex` after the copy finishes,
 so if the user has moved on by then, the icon lands on the wrong button.
 
-### U7. Changing profiles in place doesn't refresh the panel
+### U7. Changing profiles in place doesn't refresh the panel — fixed on fork
 `Service.qml:148, 159, 167, 183-185, 199`. `push`, `splice`, swapping entries,
 `p.name = …` and `defaults[k] = …` change `profiles`/`defaults` in place, and QML
 doesn't notice in-place changes. The panel only refreshes because saving the file makes
@@ -71,21 +77,31 @@ the file watcher reload it, which also pushes the buttons to the device twice. C
 `6db254a` worked around the same problem for button saves only.
 
 **Fix:** assign new arrays/objects instead (`profiles = profiles.concat([p])`, etc.).
+Pushes are also skipped when the buttons haven't changed since the last one, so the
+reload after a save no longer redraws every key.
 
-### U8. IPC commands are probably broken
+### U8. IPC commands are probably broken — fixed on fork
 - `Panel.qml:216, 231, 240`: `setButton`, `clearButton` and `setBrightness` have untyped
   arguments. Quickshell's `IpcHandler` needs typed arguments, so these are probably not
   callable, including the README example. *(Not checked against a running shell.)*
 - The `IpcHandler` lives in `Panel.qml`, which exists once per monitor, so the same IPC
   target is registered more than once. With no bar widget there's no IPC at all.
-  Move it to `Service.qml`.
 - `Panel.qml:242`: `Number(value) || 50` turns `setBrightness 0` into 50.
 
-### U9. Brightness isn't saved, and the manifest setting is ignored
+**Fix:** typed arguments; `setBrightness` validates 0–100. The handler stays in
+`Panel.qml` (its `toggle`/`open` need a panel), but only one panel enables it: the first
+to load claims it through the service, and another takes over if that one goes away.
+Still true: with no bar widget there's no IPC.
+
+### U9. Brightness isn't saved, and the manifest setting is ignored — fixed on fork
 The `brightness` default in `manifest.json` is never read; `Service.qml:27` hard-codes 50.
 Changes from the slider are lost when the shell restarts.
 
-### U10. Launched commands share the bridge's stdin
+**Fix:** brightness is saved as `brightness` in `buttons.json` (written once the slider
+settles) and read by the bridge at startup. The unused manifest setting was removed,
+since the Omarchy widget-settings API wasn't available to wire it up.
+
+### U10. Launched commands share the bridge's stdin — fixed on fork
 `scripts/streamdeck-bridge:275`. `Popen(action_value, shell=True)` inherits the bridge's
 stdin, which is the pipe the shell sends commands on, so a child that reads stdin can
 steal them. Children also stay tied to the bridge's process group and lifetime.
@@ -93,6 +109,7 @@ steal them. Children also stay tied to the bridge's process group and lifetime.
 **Fix:** `stdin=subprocess.DEVNULL, start_new_session=True`.
 
 ### Smaller upstream issues
+All fixed on the fork unless noted.
 - **Startup config load is dead code** (`main()`, `:523`): it reads a top-level
   `buttons` key that the v3 format doesn't have, so it loads nothing. *(Fixed on the fork.)*
 - **The icon cache never helps** (`:202-208`): it shares one key for all buttons,
@@ -100,26 +117,29 @@ steal them. Children also stay tied to the bridge's process group and lifetime.
   *(Fixed on the fork.)*
 - **The log file grows forever**: every event and debug line is appended to
   `~/.cache/omarchy-streamdeck-bridge.log`. Debug lines also go to stdout, where the
-  shell parses each one.
+  shell parses each one. *(Now rotated to `.log.1` past 1 MB at startup; debug lines
+  go to the file only.)*
 - **Output lines can mix together**: `log()` is called from the main thread and the
   device thread, and `print` can interleave their partial lines.
 - **Slow key handling**: `subprocess.run(["which", …])` runs on every key press (use
   `shutil.which`), and `time.sleep(0.05)` runs on the device thread.
 - **Fast presses are dropped**: the 300 ms debounce throws away legitimate quick taps,
-  such as repeated volume-up.
+  such as repeated volume-up. *(Now 100 ms; untested against real key bounce.)*
 - **Duplicate profile ids**: `Model.js` `parseConfig` gives id-less profiles
   `Date.now()` ids, so profiles parsed in the same millisecond get the same id.
 - **Theme colours with transparency are read wrong**: QML prints them as `#aarrggbb`,
   and `_hex_to_rgb` takes the first six hex digits.
 - **The `e` key** opens the editor for button 0 even before the cursor is active.
-- **`_lock`** is never used (upstream).
+- **`_lock`** is never used (upstream). *(The fork uses it for HID writes.)*
 - **Outdated docs and text**: the README shows the v1 config format; the bridge docstring
   and manifest still say XL-only; the missing-dependency message tells you to install
   `python3-streamdeck`, which is already bundled; the `"Stream Deck Original V2"` string
   in `_find_deck` never matches (V2 reports `"Stream Deck Original"`).
 - **Design**: the grid size follows the active profile, not the connected device, so an
-  XL profile on an Original quietly shows only 15 keys. `pluginDir` is hard-coded rather
-  than worked out from where the plugin is installed.
+  XL profile on an Original quietly shows only 15 keys. *(Not changed: swipe and device
+  defaults now keep each device on its own profiles.)* `pluginDir` is hard-coded rather
+  than worked out from where the plugin is installed. *(Now taken from where
+  `Service.qml` was loaded, falling back to the default install path.)*
 
 ---
 
@@ -214,10 +234,10 @@ tiles that go nowhere.
 ---
 
 ## Suggested order
-1. F1, F2, F4: these hurt daily use on the Plus.
-2. U1: no recovery after replug.
-3. U2, U3: keybindings.
-4. U4, U5, U6: icon upload.
-5. U8, U9, U10, then the rest.
+1. ~~F1, F2, F4~~ (all F items fixed).
+2. ~~U1~~ (fixed).
+3. ~~U2, U3~~ (fixed).
+4. ~~U4, U5, U6~~ (fixed).
+5. ~~U7–U10 and the smaller issues~~ (fixed).
 
 Fixes that only touch upstream code (U2–U10) could be sent upstream as PRs.

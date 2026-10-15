@@ -16,7 +16,6 @@ Panel {
 
   readonly property var service: bar && bar.shell ? bar.shell.serviceFor("elgato.streamdeck") : null
   readonly property bool serviceReady: service !== null
-  readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/elgato.streamdeck"
   readonly property string iconDir: Quickshell.env("HOME") + "/.config/omarchy/streamdeck/icons"
 
   // Proxy state from service
@@ -178,18 +177,34 @@ Panel {
     iconPickerProc.running = true
   }
 
+  // The upload in flight: which profile/button it was started for, and where
+  // the copy is going. Captured when the file is picked so a slow copy can't
+  // land on whatever button is being edited by the time it finishes.
+  property string pendingIconPath: ""
+  property string pendingIconProfileId: ""
+  property int pendingIconIndex: -1
+
   property Process iconPickerProc: Process {
-    command: ["zenity", "--file-selection", "--file-filter=*.png", "--title=Select Button Icon"]
+    command: ["zenity", "--file-selection", "--file-filter=Images | *.png *.jpg *.jpeg *.svg", "--title=Select Button Icon"]
     stdout: SplitParser {
       onRead: function(value) {
         var picked = String(value || "").trim()
         console.log("[StreamDeck] zenity picked:", picked)
-        if (picked !== "" && picked.indexOf("/") >= 0) {
-          var targetDir = root.iconDir
-          var targetPath = targetDir + "/btn_" + root.editingIndex + ".png"
-          copyIconProc.command = ["bash", "-c", "mkdir -p '" + targetDir + "' && cp '" + picked + "' '" + targetPath + "'"]
-          copyIconProc.running = true
-        }
+        if (picked === "" || picked.indexOf("/") < 0 || root.editingIndex < 0) return
+        var dot = picked.lastIndexOf(".")
+        var ext = dot > picked.lastIndexOf("/") ? picked.substring(dot).toLowerCase() : ".png"
+        // Unique per profile, button and upload: profiles can't overwrite each
+        // other's icons, cancelling an edit leaves the saved icon untouched,
+        // and the preview never shows a cached older image.
+        var profilePart = root.activeProfileId.replace(/[^A-Za-z0-9_-]/g, "_")
+        root.pendingIconProfileId = root.activeProfileId
+        root.pendingIconIndex = root.editingIndex
+        root.pendingIconPath = root.iconDir + "/" + profilePart + "_btn" + root.editingIndex
+          + "_" + Date.now().toString(36) + ext
+        // Paths go in as arguments, never into the script text.
+        copyIconProc.command = ["sh", "-c", 'mkdir -p "$1" && cp -- "$2" "$3"', "sh",
+                                root.iconDir, picked, root.pendingIconPath]
+        copyIconProc.running = true
       }
     }
     onExited: function(exitCode) {
@@ -201,11 +216,13 @@ Panel {
     command: ["true"]
     onExited: function(exitCode) {
       console.log("[StreamDeck] copyIconProc exited with code", exitCode)
-      if (exitCode === 0) {
-        root.editIconDraft = root.iconDir + "/btn_" + root.editingIndex + ".png"
-        // Auto-save the icon so it persists immediately
-        root.saveEdit()
+      // Only fill the draft; the user still saves or cancels the edit.
+      if (exitCode === 0
+          && root.editingIndex === root.pendingIconIndex
+          && root.activeProfileId === root.pendingIconProfileId) {
+        root.editIconDraft = root.pendingIconPath
       }
+      root.pendingIconIndex = -1
     }
   }
 
@@ -221,16 +238,36 @@ Panel {
 
   // ---------------------------------------------------------------- IPC
 
+  // There is one Panel per bar (so per monitor), but an IPC target can only
+  // be served by one handler. The first panel to load claims it through the
+  // service; when that panel goes away, another one takes over.
+  function claimIpc() {
+    if (serviceReady && !service.ipcOwner) service.ipcOwner = root
+  }
+  Component.onCompleted: claimIpc()
+  onServiceChanged: claimIpc()
+  Component.onDestruction: {
+    if (serviceReady && service.ipcOwner === root) service.ipcOwner = null
+  }
+  Connections {
+    target: root.service
+    ignoreUnknownSignals: true
+    function onIpcOwnerChanged() { root.claimIpc() }
+  }
+
   IpcHandler {
     target: "elgato.streamdeck"
+    enabled: root.serviceReady && root.service.ipcOwner === root
 
+    // Quickshell only exposes IPC functions whose arguments and return
+    // value have explicit types.
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
 
-    function setButton(index, label, actionType, actionValue, iconPath): string {
+    function setButton(index: int, label: string, actionType: string, actionValue: string, iconPath: string): string {
       if (index < 0 || index >= root.activeButtonCount) return "invalid index"
       if (!serviceReady) return "service unavailable"
       var newButtons = buttons.slice()
@@ -245,7 +282,7 @@ Panel {
       return "ok"
     }
 
-    function clearButton(index): string {
+    function clearButton(index: int): string {
       if (index < 0 || index >= root.activeButtonCount) return "invalid index"
       if (!serviceReady) return "service unavailable"
       var newButtons = buttons.slice()
@@ -254,10 +291,10 @@ Panel {
       return "ok"
     }
 
-    function setBrightness(value): string {
+    function setBrightness(value: int): string {
       if (!serviceReady) return "service unavailable"
-      service.brightness = Math.max(0, Math.min(100, Number(value) || 50))
-      service.pushBrightness()
+      if (value < 0 || value > 100) return "brightness must be 0-100"
+      service.setBrightness(value)
       return "ok"
     }
 
@@ -321,7 +358,7 @@ Panel {
         if (lower === "r") {
           if (serviceReady) service.reconnect()
         }
-        else if (lower === "e") root.activateCursor()
+        else if (lower === "e" && root.cursorActive) root.activateCursor()
       }
 
       Flickable {
@@ -771,10 +808,7 @@ Panel {
             value: root.brightness
             fillColor: root.accent
             onMoved: function(v) {
-              if (serviceReady) {
-                service.brightness = v
-                service.pushBrightness()
-              }
+              if (serviceReady) service.setBrightness(v)
             }
           }
         }
@@ -1222,12 +1256,12 @@ Panel {
                   spacing: Style.spacing.sm
 
                   Button {
-                    text: "Upload PNG"
+                    text: "Upload icon"
                     bordered: true
                     foreground: root.foreground
                     fontFamily: root.fontFamily
                     onClicked: {
-                      console.log("[StreamDeck] Upload PNG clicked")
+                      console.log("[StreamDeck] Upload icon clicked")
                       root.openIconPicker()
                     }
                   }

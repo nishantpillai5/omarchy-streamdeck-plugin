@@ -17,7 +17,16 @@ QtObject {
   }
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string pluginDir: home + "/.config/omarchy/plugins/elgato.streamdeck"
+  // The directory this file was loaded from, so the bridge is found wherever
+  // the plugin is installed. Falls back to the default install location if
+  // the plugin was not loaded from a local file.
+  readonly property string pluginDir: {
+    var url = String(Qt.resolvedUrl("."))
+    if (url.indexOf("file://") === 0) {
+      return decodeURIComponent(url.substring(7)).replace(/\/$/, "")
+    }
+    return home + "/.config/omarchy/plugins/elgato.streamdeck"
+  }
   readonly property string helper: pluginDir + "/scripts/streamdeck-bridge"
   readonly property string pythonBin: "/usr/bin/python3"
   readonly property string configPath: home + "/.config/omarchy/streamdeck/buttons.json"
@@ -34,6 +43,7 @@ QtObject {
   property var defaults: ({})          // { xl: profileId, original: profileId, plus: profileId }
   property bool followDevice: true     // auto-apply the per-device default on connect
   property bool configLoaded: false    // true once buttons.json has been read (or found missing)
+  property var ipcOwner: null          // the one Panel serving IPC (see Panel.claimIpc)
 
   readonly property bool isReady: phase === "ready"
   readonly property bool hasError: phase === "error"
@@ -79,6 +89,12 @@ QtObject {
     profiles = parsed.config.profiles
     defaults = parsed.config.defaults
     activeProfileId = parsed.config.activeProfileId
+    // Skip while a slider change is waiting to be saved, so an older file
+    // doesn't snap the slider back.
+    if (parsed.config.brightness !== brightness && !saveBrightnessTimer.running) {
+      brightness = parsed.config.brightness
+      if (isReady) pushBrightness()
+    }
     if (parsed.error) {
       lastError = parsed.error
       if (phase !== "ready") phase = "error"
@@ -101,26 +117,29 @@ QtObject {
       version: Model.SCHEMA_VERSION,
       activeProfileId: activeProfileId,
       profiles: profiles,
-      defaults: defaults
+      defaults: defaults,
+      brightness: brightness
     })
     configFile.setText(text)
   }
 
-  function pushButtons(buttonsArg) {
-    console.log("[StreamDeck Service] pushButtons called, bridge running:", bridgeController.running)
+  // JSON of the last button set sent to the bridge. Saving the config makes
+  // the file watcher reload it, which would push the same buttons again and
+  // redraw every key; this skips that. Cleared whenever the device (re)connects.
+  property string lastPushedButtons: ""
+
+  function pushButtons() {
     if (!bridgeController.running) {
-      console.log("[StreamDeck Service] Bridge not running, aborting")
+      console.log("[StreamDeck Service] Bridge not running, not pushing buttons")
       return
     }
-    // Accept an explicit button list (e.g. freshly-saved buttons) to avoid the
-    // stale-binding problem: mutating a nested property of `profiles` does not
-    // re-evaluate the `buttons` binding, so callers that just changed buttons
-    // pass them in directly.
-    var list = buttonsArg !== undefined ? buttonsArg : buttons
-    var activeButtons = list.filter(function(b) { return Model.hasAction(b) })
+    var activeButtons = buttons.filter(function(b) { return Model.hasAction(b) })
+    var json = JSON.stringify(activeButtons)
+    if (json === lastPushedButtons) return
     console.log("[StreamDeck Service] Sending", activeButtons.length, "buttons to bridge")
-    var sent = bridgeController.send({ op: "set_buttons", buttons: activeButtons })
-    console.log("[StreamDeck Service] send() returned:", sent)
+    if (bridgeController.send({ op: "set_buttons", buttons: activeButtons })) {
+      lastPushedButtons = json
+    }
   }
 
   function pushConfig() {
@@ -141,6 +160,15 @@ QtObject {
     bridgeController.send({ op: "set_brightness", value: brightness })
   }
 
+  // Set, apply and (after a short delay) persist the deck brightness.
+  function setBrightness(value) {
+    var v = Math.max(0, Math.min(100, Math.round(Number(value))))
+    if (isNaN(v)) return
+    brightness = v
+    pushBrightness()
+    saveBrightnessTimer.restart()
+  }
+
   function reconnect() {
     if (!bridgeController.running) {
       bridgeController.ensureStarted(false)
@@ -151,9 +179,31 @@ QtObject {
 
   // ---------------------------------------------------------------- profile ops
 
+  // `profiles` and `defaults` are plain JS values: QML only notices a change
+  // when the property is assigned, not when an element or field is mutated
+  // in place. Every edit below therefore builds a new array/object.
+
+  // Return a copy of profile `id` with `changes` applied, in a new array.
+  function profilesWithChange(id, changes) {
+    return profiles.map(function(p) {
+      if (p.id !== id) return p
+      var copy = {}
+      for (var k in p) copy[k] = p[k]
+      for (var c in changes) copy[c] = changes[c]
+      return copy
+    })
+  }
+
+  function defaultsWithChange(layoutKey, profileId) {
+    var copy = {}
+    for (var k in defaults) copy[k] = defaults[k]
+    copy[layoutKey] = profileId
+    return copy
+  }
+
   function createProfile(name, layoutKey) {
     var p = Model.newProfile(name, layoutKey)
-    profiles.push(p)
+    profiles = profiles.concat([p])
     activeProfileId = p.id
     followDevice = false
     saveConfig()
@@ -162,9 +212,8 @@ QtObject {
   }
 
   function renameProfile(id, newName) {
-    var p = profileById(id)
-    if (!p) return
-    p.name = newName
+    if (!profileById(id)) return
+    profiles = profilesWithChange(id, { name: newName })
     saveConfig()
   }
 
@@ -172,11 +221,11 @@ QtObject {
     var idx = profileIndexById(id)
     if (idx < 0) return
     if (profiles.length <= 1) return  // keep at least one profile
-    profiles.splice(idx, 1)
+    profiles = profiles.filter(function(p) { return p.id !== id })
     // Clear any default pointing at the deleted profile.
-    if (defaults.xl === id) defaults.xl = ""
-    if (defaults.original === id) defaults.original = ""
-    if (defaults.plus === id) defaults.plus = ""
+    var newDefaults = {}
+    for (var k in defaults) newDefaults[k] = defaults[k] === id ? "" : defaults[k]
+    defaults = newDefaults
     if (activeProfileId === id) {
       activeProfileId = profiles[0].id
       if (isReady && bridgeController.running) pushButtons()
@@ -189,9 +238,10 @@ QtObject {
     if (idx < 0) return
     var target = idx + delta
     if (target < 0 || target >= profiles.length) return
-    var tmp = profiles[idx]
-    profiles[idx] = profiles[target]
-    profiles[target] = tmp
+    var reordered = profiles.slice()
+    reordered[idx] = profiles[target]
+    reordered[target] = profiles[idx]
+    profiles = reordered
     saveConfig()
   }
 
@@ -205,7 +255,7 @@ QtObject {
 
   function setDefaultForLayout(layoutKey, profileId) {
     if (!Model.layoutByKey(layoutKey)) return
-    defaults[layoutKey] = profileId
+    defaults = defaultsWithChange(layoutKey, profileId)
     saveConfig()
   }
 
@@ -233,24 +283,19 @@ QtObject {
     }
     if (!match) {
       match = Model.newProfile(layout.label, layoutKey)
-      // Assign a new array so bindings on `profiles` re-evaluate.
       profiles = profiles.concat([match])
     }
-    var newDefaults = {}
-    for (var k in defaults) newDefaults[k] = defaults[k]
-    newDefaults[layoutKey] = match.id
-    defaults = newDefaults
+    defaults = defaultsWithChange(layoutKey, match.id)
     saveConfig()
     return match.id
   }
 
   // Replace the buttons for a profile, then persist.
   function saveProfileButtons(profileId, newButtons) {
-    var p = profileById(profileId)
-    if (!p) return
-    p.buttons = newButtons
+    if (!profileById(profileId)) return
+    profiles = profilesWithChange(profileId, { buttons: newButtons })
     if (profileId === activeProfileId && isReady && bridgeController.running) {
-      pushButtons(newButtons)
+      pushButtons()
     }
     saveConfig()
   }
@@ -274,10 +319,13 @@ QtObject {
         root.activeProfileId = root.ensureDeviceProfile(Model.layoutKeyForDeckType(root.deckType))
       }
       console.log("[StreamDeck Service] device ready, active profile:", root.activeProfileId)
+      // A (re)connected deck starts blank: force the next push through.
+      root.lastPushedButtons = ""
       delayPushTimer.start()
       break
     case "disconnected":
       root.phase = "idle"
+      root.lastPushedButtons = ""
       break
     case "error":
       root.phase = "error"
@@ -320,7 +368,16 @@ QtObject {
     onFailed: function(message) {
       root.phase = "error"
       root.lastError = message
+      root.lastPushedButtons = ""
     }
+  }
+
+  // Brightness changes arrive on every slider step; write the config once the
+  // slider has settled rather than on each step.
+  property Timer saveBrightnessTimer: Timer {
+    interval: 600
+    repeat: false
+    onTriggered: root.saveConfig()
   }
 
   property Timer delayPushTimer: Timer {

@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
-"""Stream Deck XL control bridge for the Omarchy shell.
+"""Stream Deck control bridge for the Omarchy shell.
 
-Reads JSON commands from stdin, one per line. Emits JSON events to stdout.
-Maintains persistent USB connection to the Stream Deck XL.
+Supports the Stream Deck XL (32 keys), Original / Original V2 / MK.2 (15 keys)
+and Stream Deck + (8 keys, 4 dials, 800x100 touch strip). Keeps a USB
+connection to the first supported deck found.
+
+Reads JSON commands from stdin, one per line. Emits JSON events to stdout, one
+per line. Debug output goes only to ~/.cache/omarchy-streamdeck-bridge.log.
 
 Commands (stdin):
   {"op":"config","brightness":50,"colors":{"fg":"#ffffff","bg":"#1a1a1a","accent":"#ff7700"}}
   {"op":"set_buttons","buttons":[{...}]}
   {"op":"set_brightness","value":50}
+  {"op":"reconnect"}
+  {"op":"ping"}
   {"op":"exit"}
 
 Events (stdout):
-  {"ev":"ready","serial":"...","button_count":32}
-  {"ev":"disconnected"}
-  {"ev":"button_down","index":5}
-  {"ev":"button_up","index":5}
+  {"ev":"ready","serial":"...","deck_type":"Stream Deck XL","button_count":32}
+  {"ev":"disconnected"}                      also sent when the deck is unplugged
   {"ev":"error","message":"..."}
+  {"ev":"button_down","index":5}  /  {"ev":"button_up","index":5}
+  {"ev":"swipe","direction":1}               touch strip: 1 = next profile, -1 = previous
+  {"ev":"dial_turn",...} {"ev":"dial_push",...} {"ev":"touch_mute",...}
+  {"ev":"audio_key","label":"..."} {"ev":"audio_cycle"} {"ev":"magnitude_key","label":"..."}
+  {"ev":"pong"}
 
 Button config schema (in set_buttons):
   {
-    "index": 0..31,
+    "index": 0..(key count - 1),
     "label": "text on button",
-    "icon_path": "/path/to/image.png",   // optional: overrides generated icon
-    "action_type": "command" | "keybinding",
-    "action_value": "shell command or key combo"
+    "icon_path": "/path/to/icon.png|.jpg|.svg",   // optional: overrides generated icon
+    "action_type": "command" | "keybinding" | "audio_output" | "magnitude",
+    "action_value": "shell command or key combo (e.g. SUPER+ALT+Return)"
   }
 
-The Stream Deck XL has 32 buttons (8 cols x 4 rows).
-Icon size: 96x96 pixels (the XL uses 96x96 key images).
+Key image size comes from the connected deck (96x96 on the XL, 72x72 on the
+Original, 120x120 on the +).
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -52,14 +62,40 @@ if SCRIPT_DIR not in sys.path:
 
 LOGFILE = Path.home() / ".cache" / "omarchy-streamdeck-bridge.log"
 LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+LOG_MAX_BYTES = 1_000_000  # rotated to .log.1 at startup once it is bigger
 
-def log(msg):
-    print(msg, flush=True)
+# log() is called from the main, device-reader and worker threads; serialize
+# writes so stdout lines (which the shell parses as NDJSON) never interleave.
+_log_lock = threading.Lock()
+
+
+def _rotate_log():
+    try:
+        if LOGFILE.stat().st_size > LOG_MAX_BYTES:
+            LOGFILE.replace(LOGFILE.with_name(LOGFILE.name + ".1"))
+    except OSError:
+        pass
+
+
+def _write_logfile(msg):
     try:
         with open(LOGFILE, "a") as f:
             f.write(msg + "\n")
     except Exception:
         pass
+
+
+def log(msg):
+    """Emit an event line to the shell (stdout) and the log file."""
+    with _log_lock:
+        print(msg, flush=True)
+        _write_logfile(msg)
+
+
+def debug(msg):
+    """Write a debug line to the log file only; the shell never needs these."""
+    with _log_lock:
+        _write_logfile(json.dumps({"ev": "debug", "msg": msg}))
 
 
 try:
@@ -69,7 +105,7 @@ try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError as exc:
     # Emit error as JSON so the QML panel can display it
-    log(json.dumps({"ev": "error", "message": f"Missing dependency: {exc}. Install python3-streamdeck and python-pillow."}))
+    log(json.dumps({"ev": "error", "message": f"Missing dependency: {exc}. Install python-pillow and hidapi (the streamdeck package is bundled)."}))
     sys.exit(1)
 
 # Defaults for when no device is connected yet (XL).
@@ -84,6 +120,7 @@ PINNED_APPS = [
 ]
 SWIPE_MIN_PX = 60   # min horizontal px for a strip swipe to page between profiles
 ICON_GLYPH_SIZE = 48  # rendered size of key icon glyphs (kept uniform across keys)
+PRESS_DEBOUNCE_S = 0.1  # repeat presses of one key closer than this are ignored (was 0.3)
 
 class StreamDeckBridge:
     def __init__(self):
@@ -105,13 +142,14 @@ class StreamDeckBridge:
         self._font: ImageFont.FreeTypeFont | None = None
         self._cached_icons: dict[int, bytes] = {}
         self._cache_keys: dict[int, str] = {}
-        # Dial/touch work runs on its own thread so the device reader thread
-        # (which also delivers key presses) never waits on wpctl/pactl.
-        # Turn notches that arrive while a turn is pending are merged into it.
-        self._audio_tasks: queue.Queue = queue.Queue()
+        # Dial, touch and keybinding work runs on its own thread so the device
+        # reader thread (which also delivers key presses) never waits on
+        # wpctl/pactl/wtype. Turn notches that arrive while a turn is pending
+        # are merged into it.
+        self._tasks: queue.Queue = queue.Queue()
         self._turn_lock = threading.Lock()
         self._pending_turns: dict[int, int] = {}
-        threading.Thread(target=self._audio_worker, daemon=True).start()
+        threading.Thread(target=self._task_worker, daemon=True).start()
 
     def _has_touchscreen(self) -> bool:
         """True if the connected deck has a touch strip (only the Plus).
@@ -120,14 +158,14 @@ class StreamDeckBridge:
         without a strip), so check the strip's size instead."""
         return bool(self.deck) and getattr(self.deck, "TOUCHSCREEN_PIXEL_WIDTH", 0) > 0
 
-    def _audio_worker(self):
-        """Run queued dial/touch actions one at a time, in arrival order."""
+    def _task_worker(self):
+        """Run queued dial/touch/keybinding actions one at a time, in order."""
         while True:
-            task = self._audio_tasks.get()
+            task = self._tasks.get()
             try:
                 task()
             except Exception as exc:
-                log(json.dumps({"ev": "error", "message": f"audio task: {exc}"}))
+                log(json.dumps({"ev": "error", "message": f"task: {exc}"}))
 
     def _icon_size(self) -> tuple[int, int]:
         """Return (width, height) of a key image for the current device."""
@@ -466,7 +504,7 @@ class StreamDeckBridge:
     def _update_button(self, index: int):
         """Push a single button's image to the hardware."""
         if not self.deck:
-            log(json.dumps({"ev": "debug", "msg": f"_update_button[{index}]: no deck"}))
+            debug(f"_update_button[{index}]: no deck")
             return
         count = self._button_count()
         if index < 0 or index >= count:
@@ -487,12 +525,12 @@ class StreamDeckBridge:
     def _update_all_buttons(self):
         """Push all configured buttons to the hardware."""
         if not self.deck:
-            log(json.dumps({"ev": "debug", "msg": "_update_all_buttons: no deck"}))
+            debug("_update_all_buttons: no deck")
             return
-        log(json.dumps({"ev": "debug", "msg": f"Updating {self._button_count()} buttons ({len(self.buttons)} configured)"}))
+        debug(f"Updating {self._button_count()} buttons ({len(self.buttons)} configured)")
         for index in range(self._button_count()):
             self._update_button(index)
-        log(json.dumps({"ev": "debug", "msg": "All buttons updated"}))
+        debug("All buttons updated")
 
     def _list_sinks(self):
         """List audio output sinks as (name, description) tuples."""
@@ -700,14 +738,15 @@ class StreamDeckBridge:
         event_type = "button_down" if state else "button_up"
         log(json.dumps({"ev": event_type, "index": key, "state": state}))
         if state:
-            # Debounce: ignore presses within 300ms of each other
-            import time
+            # Debounce: ignore a repeat press of the same key within
+            # PRESS_DEBOUNCE_S, so contact bounce can't fire an action twice
+            # while quick deliberate taps (e.g. volume up) still register.
             now = time.time()
             if not hasattr(self, '_last_press_time'):
                 self._last_press_time = {}
             last_time = self._last_press_time.get(key, 0)
-            if now - last_time < 0.3:
-                log(json.dumps({"ev": "debug", "msg": f"Debounced press for key {key}"}))
+            if now - last_time < PRESS_DEBOUNCE_S:
+                debug(f"Debounced press for key {key}")
                 return
             self._last_press_time[key] = now
             self._handle_press(key)
@@ -788,7 +827,7 @@ class StreamDeckBridge:
         """Callback when a Stream Deck dial is turned or pushed.
 
         Runs on the device reader thread, so it only queues work for
-        _audio_worker. Turn notches for a dial accumulate until the worker
+        _task_worker. Turn notches for a dial accumulate until the worker
         picks them up, so a fast spin becomes one volume change instead of
         a backlog of them.
         """
@@ -802,10 +841,10 @@ class StreamDeckBridge:
                 queued = dial in self._pending_turns
                 self._pending_turns[dial] = self._pending_turns.get(dial, 0) + amount
             if not queued:
-                self._audio_tasks.put(lambda: self._apply_dial_turn(dial))
+                self._tasks.put(lambda: self._apply_dial_turn(dial))
         elif event_type == DialEventType.PUSH:
             if value:
-                self._audio_tasks.put(lambda: self._dial_push(dial))
+                self._tasks.put(lambda: self._dial_push(dial))
 
     def _apply_dial_turn(self, dial):
         """Apply all turn notches accumulated for `dial` (worker thread)."""
@@ -900,7 +939,7 @@ class StreamDeckBridge:
         """Callback when the touch strip is touched.
 
         Runs on the device reader thread: swipes are reported to the shell
-        straight away, taps are queued for _audio_worker."""
+        straight away, taps are queued for _task_worker."""
         value = value if isinstance(value, dict) else {}
         # Swipe (drag) on the strip pages between profiles.
         if event_type == TouchscreenEventType.DRAG:
@@ -909,7 +948,7 @@ class StreamDeckBridge:
         if event_type != TouchscreenEventType.SHORT:
             return
         x = value.get("x", 0)
-        self._audio_tasks.put(lambda: self._touch_tap(x))
+        self._tasks.put(lambda: self._touch_tap(x))
 
     def _touch_tap(self, x):
         """Toggle the mute of the tile tapped at `x` (worker thread)."""
@@ -968,7 +1007,7 @@ class StreamDeckBridge:
         y1 = value.get("y_out", y0)
         dx = x1 - x0
         dy = y1 - y0
-        log(json.dumps({"ev": "debug", "msg": f"strip drag x0={x0} y0={y0} x1={x1} y1={y1} dx={dx} dy={dy}"}))
+        debug(f"strip drag x0={x0} y0={y0} x1={x1} y1={y1} dx={dx} dy={dy}")
         if abs(dx) < SWIPE_MIN_PX or abs(dx) <= abs(dy):
             return
         direction = 1 if dx < 0 else -1
@@ -1263,11 +1302,11 @@ class StreamDeckBridge:
 
     def _handle_press(self, index: int):
         """Execute the action mapped to a button index."""
-        log(json.dumps({"ev": "debug", "msg": f"_handle_press({index}) called"}))
-        log(json.dumps({"ev": "debug", "msg": f"Available buttons: {list(self.buttons.keys())}"}))
+        debug(f"_handle_press({index}) called")
+        debug(f"Available buttons: {list(self.buttons.keys())}")
         btn = self.buttons.get(index)
         if not btn:
-            log(json.dumps({"ev": "debug", "msg": f"No button configured at index {index}"}))
+            debug(f"No button configured at index {index}")
             return
         action_type = btn.get("action_type", "")
         action_value = btn.get("action_value", "")
@@ -1284,126 +1323,137 @@ class StreamDeckBridge:
             if action_type in ("command", "magnitude"):
                 # Execute shell command detached (magnitude keys run their
                 # toggle script; the poll loop refreshes the key label).
-                subprocess.Popen(action_value, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # stdin is the shell's command pipe to this bridge, so the
+                # child must not inherit it; a new session keeps launched apps
+                # independent of the bridge's lifetime.
+                subprocess.Popen(action_value, shell=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
                 if action_type == "magnitude":
                     # Poll faster for a while so the transitional labels
                     # (Preparing / Loading % / Finalizing / Stopping) are
                     # visible; see _magnitude_fast_polling.
                     self._magnitude_fast_until = time.time() + 15
             elif action_type == "keybinding":
-                # Use wtype or ydotool or hyprctl dispatch
-                # Try multiple methods for robustness
-                self._send_keybinding(action_value)
+                # On the worker thread: _send_keybinding sleeps briefly, and
+                # the reader thread must stay free for further presses.
+                self._tasks.put(lambda: self._send_keybinding(action_value))
         except Exception as exc:
             log(json.dumps({"ev": "error", "message": f"action[{index}]: {exc}"}))
 
+    # Modifier aliases accepted in key combos, mapped to wtype's modifier
+    # names (wtype only knows shift/ctrl/alt/logo/win/capslock/altgr).
+    _WTYPE_MODS = {
+        "super": "logo", "win": "logo", "cmd": "logo", "logo": "logo",
+        "ctrl": "ctrl", "control": "ctrl",
+        "alt": "alt",
+        "shift": "shift",
+    }
+
+    # Friendly key names -> xkb keysym names (for wtype). wtype looks keysyms
+    # up case-insensitively, so anything else (a, F5, slash,
+    # XF86AudioRaiseVolume, ...) is passed through as typed.
+    _KEYSYM_ALIASES = {
+        "enter": "Return",
+        "esc": "Escape",
+        "del": "Delete",
+        "pageup": "Page_Up",
+        "pagedown": "Page_Down",
+    }
+
+    # Linux evdev key codes (input-event-codes.h) for the ydotool fallback,
+    # which takes raw codes rather than key names.
+    _EVDEV_MODS = {"logo": 125, "ctrl": 29, "alt": 56, "shift": 42}
+    _EVDEV_KEYS = {
+        **{c: code for c, code in zip("1234567890", range(2, 12))},
+        **{c: code for c, code in zip("qwertyuiop", range(16, 26))},
+        **{c: code for c, code in zip("asdfghjkl", range(30, 39))},
+        **{c: code for c, code in zip("zxcvbnm", range(44, 51))},
+        **{f"f{n}": 58 + n for n in range(1, 11)}, "f11": 87, "f12": 88,
+        "escape": 1, "esc": 1, "minus": 12, "equal": 13, "backspace": 14,
+        "tab": 15, "bracketleft": 26, "bracketright": 27, "return": 28,
+        "enter": 28, "semicolon": 39, "apostrophe": 40, "grave": 41,
+        "backslash": 43, "comma": 51, "period": 52, "slash": 53, "space": 57,
+        "print": 99, "home": 102, "up": 103, "page_up": 104, "pageup": 104,
+        "left": 105, "right": 106, "end": 107, "down": 108, "page_down": 109,
+        "pagedown": 109, "insert": 110, "delete": 111, "del": 111,
+        "xf86audiomute": 113, "xf86audiolowervolume": 114,
+        "xf86audioraisevolume": 115, "xf86audionext": 163,
+        "xf86audioplay": 164, "xf86audioprev": 165,
+    }
+
+    @staticmethod
+    def _parse_combo(combo: str):
+        """Split "SUPER+ALT+Return" into (["logo", "alt"], "Return").
+
+        Modifiers are normalised to wtype names; unknown modifiers raise
+        ValueError. The key keeps its original case. A trailing "+" key
+        (e.g. "CTRL++") is read as "plus".
+        """
+        combo = combo.strip()
+        if combo.endswith("++"):
+            parts, key = combo[:-2].split("+"), "plus"
+        else:
+            parts = combo.split("+")
+            key = parts.pop().strip()
+        mods = []
+        for part in parts:
+            name = part.strip().lower()
+            if not name:
+                continue
+            if name not in StreamDeckBridge._WTYPE_MODS:
+                raise ValueError(f"unknown modifier '{part.strip()}'")
+            mods.append(StreamDeckBridge._WTYPE_MODS[name])
+        if not key:
+            raise ValueError("missing key")
+        return mods, key
+
     def _send_keybinding(self, combo: str):
-        """Send a keybinding using available tools."""
-        # Parse combos like "SUPER+ALT+ENTER" or "CTRL+SHIFT+t"
-        # Try wtype first (Wayland), then ydotool, then hyprctl dispatch
-        parts = combo.upper().split("+")
-        key = parts[-1].strip().lower()
-        modifiers = [p.strip() for p in parts[:-1]]
-        log(json.dumps({"ev": "debug", "msg": f"Keybinding: combo={combo}, key={key}, modifiers={modifiers}"}))
+        """Send a key combo through a virtual keyboard so compositor binds fire.
 
-        # Try wtype
-        wtype_path = subprocess.run(["which", "wtype"], capture_output=True, text=True).stdout.strip()
-        if wtype_path:
-            mod_args = []
-            for mod in modifiers:
-                mod_lower = mod.lower()
-                if mod_lower in ("super", "win", "cmd"):
-                    mod_args.extend(["-M", "logo"])
-                elif mod_lower == "alt":
-                    mod_args.extend(["-M", "alt"])
-                elif mod_lower == "ctrl":
-                    mod_args.extend(["-M", "control"])
-                elif mod_lower == "shift":
-                    mod_args.extend(["-M", "shift"])
-            # Map common key names to xkbcommon names (wtype)
-            key_map = {
-                "enter": "Return",
-                "return": "Return",
-                "space": "space",
-                "tab": "Tab",
-                "escape": "Escape",
-                "esc": "Escape",
-                "backspace": "BackSpace",
-                "delete": "Delete",
-                "up": "Up",
-                "down": "Down",
-                "left": "Left",
-                "right": "Right",
-                "pageup": "Page_Up",
-                "pagedown": "Page_Down",
-                "home": "Home",
-                "end": "End",
-                "insert": "Insert",
-            }
-            wtype_key = key_map.get(key, key.capitalize())
-            # Use explicit press/release for better compatibility
-            # Add small delay for compositor to register modifier
-            import time
+        Tries wtype first, then ydotool (needs ydotoold running). Hyprland's
+        `sendshortcut` is not used: it delivers keys to a window and skips
+        Hyprland's own binds, which is what most Stream Deck keys target.
+        """
+        try:
+            mods, key = self._parse_combo(combo)
+        except ValueError as exc:
+            log(json.dumps({"ev": "error", "message": f"Keybinding '{combo}': {exc}"}))
+            return
+        debug(f"Keybinding: combo={combo}, key={key}, modifiers={mods}")
+
+        if shutil.which("wtype"):
+            keysym = self._KEYSYM_ALIASES.get(key.lower(), key)
+            # Small delay so the compositor has released the deck's own input
+            # before the virtual keyboard presses modifiers.
             time.sleep(0.05)
-            args = ["wtype"] + mod_args + ["-P", wtype_key, "-p", wtype_key]
-            for mod in modifiers:
-                mod_lower = mod.lower()
-                if mod_lower in ("super", "win", "cmd"):
-                    args.extend(["-m", "logo"])
-                elif mod_lower == "alt":
-                    args.extend(["-m", "alt"])
-                elif mod_lower == "ctrl":
-                    args.extend(["-m", "control"])
-                elif mod_lower == "shift":
-                    args.extend(["-m", "shift"])
-            log(json.dumps({"ev": "debug", "msg": f"wtype command: {args}"}))
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            args = ["wtype"]
+            for mod in mods:
+                args += ["-M", mod]
+            args += ["-P", keysym, "-p", keysym]
+            for mod in reversed(mods):
+                args += ["-m", mod]
+            debug(f"wtype command: {args}")
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
 
-        # Try hyprctl dispatch (for Hyprland)
-        hyprctl_path = subprocess.run(["which", "hyprctl"], capture_output=True, text=True).stdout.strip()
-        if hyprctl_path:
-            # Map to hyprctl key format
-            mod_str = ""
-            for mod in modifiers:
-                mod_lower = mod.lower()
-                if mod_lower in ("super", "win"):
-                    mod_str += "SUPER_"
-                elif mod_lower == "alt":
-                    mod_str += "ALT_"
-                elif mod_lower == "ctrl":
-                    mod_str += "CONTROL_"
-                elif mod_lower == "shift":
-                    mod_str += "SHIFT_"
-            hypr_key = key.upper()
-            full_key = mod_str + hypr_key if mod_str else hypr_key
-            subprocess.Popen(["hyprctl", "dispatch", "exec", f"ydotool key {full_key}"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if shutil.which("ydotool"):
+            code = self._EVDEV_KEYS.get(key.lower())
+            if code is None:
+                log(json.dumps({"ev": "error", "message": f"Keybinding '{combo}': ydotool has no key code for '{key}'"}))
+                return
+            mod_codes = [self._EVDEV_MODS[m] for m in mods]
+            events = [f"{c}:1" for c in mod_codes] + [f"{code}:1", f"{code}:0"]
+            events += [f"{c}:0" for c in reversed(mod_codes)]
+            debug(f"ydotool key {' '.join(events)}")
+            subprocess.Popen(["ydotool", "key", *events],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
 
-        # Fallback: try ydotool directly
-        ydotool_path = subprocess.run(["which", "ydotool"], capture_output=True, text=True).stdout.strip()
-        if ydotool_path:
-            mod_str = ""
-            for mod in modifiers:
-                mod_lower = mod.lower()
-                if mod_lower in ("super", "win"):
-                    mod_str += "125:1 "
-                elif mod_lower == "alt":
-                    mod_str += "56:1 "
-                elif mod_lower == "ctrl":
-                    mod_str += "29:1 "
-                elif mod_lower == "shift":
-                    mod_str += "42:1 "
-            # Need keycode mapping - this is approximate
-            subprocess.Popen(["ydotool", "key", mod_str + key],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-
-        log(json.dumps({"ev": "error", "message": f"No keybinding tool available (tried wtype, hyprctl, ydotool)"}))
+        log(json.dumps({"ev": "error", "message": "No keybinding tool available (install wtype, or ydotool with ydotoold running)"}))
 
     def _find_deck(self):
-        """Discover and open any Stream Deck (XL, Original, V2)."""
+        """Discover and open a supported Stream Deck (XL, Original/V2/MK.2, +)."""
         devices = DeviceManager().enumerate()
         for device in devices:
             try:
@@ -1411,8 +1461,9 @@ class StreamDeckBridge:
             except Exception:
                 continue
             dtype = device.deck_type()
-            # Accept known key-based devices (ignore pedals)
-            if dtype in ("Stream Deck XL", "Stream Deck Original", "Stream Deck Original V2", "Stream Deck +"):
+            # Accept known key-based devices (ignore pedals). The Original V2
+            # and MK.2 also report "Stream Deck Original".
+            if dtype in ("Stream Deck XL", "Stream Deck Original", "Stream Deck +"):
                 self.deck = device
                 self.deck_type = dtype
                 self.serial = device.get_serial_number()
@@ -1464,6 +1515,31 @@ class StreamDeckBridge:
             self.deck = None
         log(json.dumps({"ev": "disconnected"}))
 
+    def _check_connection(self):
+        """Notice when the deck has been unplugged.
+
+        The vendored library's reader thread stops and closes the device on a
+        USB error without telling anyone, so check for that (and for the
+        device having vanished from the HID bus) and report `disconnected`.
+        The shell's auto-connect timer then reconnects once it is back.
+        """
+        deck = self.deck
+        if not deck:
+            return
+        try:
+            alive = deck.is_open() and deck.connected()
+        except Exception:
+            alive = False
+        if alive:
+            return
+        with self._lock:
+            self.deck = None
+        try:
+            deck.close()
+        except Exception:
+            pass
+        log(json.dumps({"ev": "disconnected", "reason": "device lost"}))
+
     def set_brightness(self, value: int):
         self.brightness = max(0, min(100, value))
         if self.deck:
@@ -1472,8 +1548,26 @@ class StreamDeckBridge:
             except Exception as exc:
                 log(json.dumps({"ev": "error", "message": f"Brightness: {exc}"}))
 
+    @staticmethod
+    def _normalize_color(value, fallback: str) -> str:
+        """Return a colour as "#rrggbb".
+
+        QML's color.toString() gives "#aarrggbb" for colours with alpha; the
+        image code and SVG tinting expect plain RGB, so drop the alpha byte.
+        Anything unparseable falls back to `fallback`.
+        """
+        hex_color = str(value or "").strip().lstrip("#")
+        if len(hex_color) == 8:
+            hex_color = hex_color[2:]
+        try:
+            int(hex_color, 16)
+        except ValueError:
+            return fallback
+        return "#" + hex_color.lower() if len(hex_color) == 6 else fallback
+
     def set_colors(self, colors: dict):
-        self.colors = colors
+        self.colors = {key: self._normalize_color(colors.get(key), default)
+                       for key, default in self.colors.items()}
         self._cached_icons.clear()
         self._cache_keys.clear()
         self._official_icon_cache.clear()
@@ -1521,6 +1615,7 @@ class StreamDeckBridge:
                 try:
                     line = q.get(timeout=0.5 if self._magnitude_fast_polling() else 3.0)
                 except _queue.Empty:
+                    self._check_connection()
                     self._maybe_refresh_audio_keys()
                     self._maybe_refresh_magnitude_keys()
                     continue
@@ -1540,11 +1635,11 @@ class StreamDeckBridge:
 
                 elif op == "set_buttons":
                     btns = cmd.get("buttons", [])
-                    log(json.dumps({"ev": "debug", "msg": f"set_buttons received with {len(btns)} buttons"}))
+                    debug(f"set_buttons received with {len(btns)} buttons")
                     self.set_buttons(btns)
 
                 elif op == "set_brightness":
-                    log(json.dumps({"ev": "debug", "msg": f"set_brightness: {cmd.get('value', 50)}"}))
+                    debug(f"set_brightness: {cmd.get('value', 50)}")
                     self.set_brightness(cmd.get("value", 50))
 
                 elif op == "reconnect":
@@ -1568,6 +1663,7 @@ class StreamDeckBridge:
 
 
 def main():
+    _rotate_log()
     bridge = StreamDeckBridge()
     
     # Load buttons from config file on startup
@@ -1596,9 +1692,11 @@ def main():
                 idx = btn.get("index", -1)
                 if 0 <= idx < BUTTON_COUNT:
                     bridge.buttons[idx] = btn
-            log(json.dumps({"ev": "debug", "msg": f"Loaded {len(bridge.buttons)} buttons from {config_path}"}))
+            if isinstance(config.get("brightness"), (int, float)):
+                bridge.brightness = max(0, min(100, int(config["brightness"])))
+            debug(f"Loaded {len(bridge.buttons)} buttons from {config_path}")
     except Exception as exc:
-        log(json.dumps({"ev": "debug", "msg": f"Could not load config: {exc}"}))
+        debug(f"Could not load config: {exc}")
     
     bridge.run()
 

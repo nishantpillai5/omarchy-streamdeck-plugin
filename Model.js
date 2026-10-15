@@ -10,14 +10,16 @@
 //     {
 //       "id": "work-xl",
 //       "name": "Work XL",
-//       "layout": "xl",          // "xl" (32 keys) | "original" (15 keys)
+//       "layout": "xl",          // "xl" (32 keys) | "original" (15 keys) | "plus" (8 keys)
 //       "buttons": [ { "index": 0, "label": "...", "icon_path": "", "action_type": "command", "action_value": "..." }, ... ]
 //     }
 //   ],
 //   "defaults": {
 //     "xl": "work-xl",           // profile id auto-applied when an XL connects
-//     "original": "work-orig"    // profile id auto-applied when an Original connects
-//   }
+//     "original": "work-orig",   // profile id auto-applied when an Original connects
+//     "plus": ""                 // profile id auto-applied when a Stream Deck + connects
+//   },
+//   "brightness": 50             // deck brightness, 0-100
 // }
 //
 // Legacy schemas are migrated on load:
@@ -75,8 +77,21 @@ function emptyButtons(count) {
   return arr;
 }
 
+// Time plus a random suffix: several ids made in the same millisecond (e.g.
+// while parsing a config whose profiles lack ids) must still be distinct.
 function newProfileId() {
-  return "profile-" + Date.now().toString(36);
+  return "profile-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7);
+}
+
+var DEFAULT_BRIGHTNESS = 50;
+
+// Brightness stored in a parsed config object, or the default.
+function brightnessFrom(parsed) {
+  var b = parsed && typeof parsed === "object" ? Number(parsed.brightness) : NaN;
+  if (parsed && parsed.brightness !== undefined && !isNaN(b)) {
+    return Math.max(0, Math.min(100, Math.round(b)));
+  }
+  return DEFAULT_BRIGHTNESS;
 }
 
 function newProfile(name, layoutKey) {
@@ -101,7 +116,8 @@ function emptyConfig() {
     version: SCHEMA_VERSION,
     activeProfileId: "xl",
     profiles: [xl, orig, plus],
-    defaults: { xl: "xl", original: "original", plus: "plus" }
+    defaults: { xl: "xl", original: "original", plus: "plus" },
+    brightness: DEFAULT_BRIGHTNESS
   };
 }
 
@@ -132,7 +148,18 @@ function normalizeProfile(src, fallbackId, fallbackName, fallbackLayout) {
   };
 }
 
+// Parse buttons.json text into { config, error }. Never throws: on bad input
+// it returns a fresh config plus an error message.
 function parseConfig(text) {
+  var result = parseProfiles(text);
+  var parsed = null;
+  try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+  result.config.brightness = brightnessFrom(parsed);
+  return result;
+}
+
+// The profile part of parseConfig (all schema versions).
+function parseProfiles(text) {
   if (!text || !text.trim()) {
     return { config: emptyConfig(), error: "" };
   }
